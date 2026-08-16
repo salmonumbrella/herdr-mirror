@@ -28,6 +28,10 @@ const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
 /// Plugin-action leg: open the popup that runs the menu below.
 pub async fn summon(env: Env) -> Result<()> {
     let api = ApiClient::connect(&env.local_socket).await?;
+    open_popup(&api, &env).await
+}
+
+async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
     // size the popup to its content: options + title + hints + border
     let n_hosts = load_config(&env.config_search).map(|c| c.hosts.len()).unwrap_or(0);
     let mut params = json!({
@@ -54,6 +58,52 @@ pub async fn summon(env: Env) -> Result<()> {
         api.request("plugin.pane.open", params).await?;
     }
     Ok(())
+}
+
+/// workspace.created hook: turn a native "new workspace" that landed in the
+/// `.mirror-pane` placeholder into the picker. herdr can't rebind the
+/// sidebar's mouse button (no *_button_plugin_action exists), so the botched
+/// workspace that click produces from inside a mirror — focused, one bare
+/// agentless pane, cwd = the placeholder — is recognized, closed, and
+/// replaced by the popup. Every guard matters: daemon-built mirrors carry a
+/// "host: label" name and are created unfocused, and the focused requirement
+/// is what keeps this from eating older placeholder workspaces the user
+/// merely clicks on.
+pub async fn intercept(env: Env) -> Result<()> {
+    // let the create→focus pair settle before looking
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let placeholder = env.state_dir.join(".mirror-pane");
+    let api = ApiClient::connect(&env.local_socket).await?;
+
+    let ws: Value = api.request("workspace.list", json!({})).await?;
+    let Some(w) = ws
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|w| w.get("focused").and_then(Value::as_bool) == Some(true)))
+    else {
+        return Ok(());
+    };
+    if w.get("label").and_then(Value::as_str) != Some(".mirror-pane")
+        || w.get("pane_count").and_then(Value::as_u64) != Some(1)
+    {
+        return Ok(());
+    }
+    let Some(ws_id) = w.get("workspace_id").and_then(Value::as_str) else { return Ok(()) };
+
+    let panes: Value = api.request("pane.list", json!({})).await?;
+    let Some(p) = panes.get("panes").and_then(Value::as_array).and_then(|a| {
+        a.iter().find(|p| p.get("workspace_id").and_then(Value::as_str) == Some(ws_id))
+    }) else {
+        return Ok(());
+    };
+    let is_bare = p.get("agent").map_or(true, Value::is_null)
+        && p.get("cwd").and_then(Value::as_str) == placeholder.to_str();
+    if !is_bare {
+        return Ok(());
+    }
+
+    api.request("workspace.close", json!({ "workspace_id": ws_id })).await?;
+    open_popup(&api, &env).await
 }
 
 /// The invoking pane's cwd, from the shell-binding env var or the

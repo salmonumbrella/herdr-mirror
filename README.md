@@ -117,6 +117,13 @@ type = "plugin_action"
 command = "mirror.new-workspace-pick"
 ```
 
+The sidebar's mouse "+" can't be rebound (herdr has no button action
+setting), so the picker catches it after the fact: a native create from
+inside a mirror lands as a one-pane workspace in the `.mirror-pane`
+placeholder, and a `workspace.created` hook recognizes exactly that shape,
+closes it, and opens the picker instead. Native creation from any normal
+workspace is untouched.
+
 **One key for both worlds** — outside a mirror they degrade to the plain local
 action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`

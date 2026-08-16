@@ -102,6 +102,10 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
                 rt.block_on(pick::summon(Env::resolve()?))
             }
         }
+        "intercept-new" => {
+            // workspace.created hook — cheap, silent no-op when nothing matches
+            rt.block_on(pick::intercept(Env::resolve()?))
+        }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
         "remote-split" => rt.block_on(remote_action::run_cmd(
