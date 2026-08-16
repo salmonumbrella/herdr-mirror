@@ -105,7 +105,11 @@ mirrors back within seconds.
 **Or ask every time** — the **new-workspace-pick** action pops up a picker
 listing *this machine* plus every host in `hosts.toml`; the new workspace is
 created wherever you choose. Arrows or `j`/`k` move, digits pick directly,
-`Enter` confirms, `Esc` cancels. Local creation inherits the invoking pane's
+`Enter` confirms, `Esc` cancels. Rows carry their context — the cwd the local
+workspace would inherit, each host's ssh target and default marker — and a
+remote pick follows through: once the daemon mirrors the new workspace back,
+the picker focuses it, so choosing a host lands you in the workspace just
+like choosing this machine does. Local creation inherits the invoking pane's
 cwd (never the `.mirror-pane` placeholder); remote creation uses the remote's
 default, like `remote-new-workspace` outside a mirror. Bound over the native
 new-workspace key it turns "new workspace" into a where-do-you-want-it prompt:

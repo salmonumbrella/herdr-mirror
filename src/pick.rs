@@ -32,18 +32,33 @@ pub async fn summon(env: Env) -> Result<()> {
 }
 
 async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
-    // size the popup to its content: options + title + hints + border
-    let n_hosts = load_config(&env.config_search).map(|c| c.hosts.len()).unwrap_or(0);
+    // size the popup to its content: options + title + hints + border. Width
+    // tracks the longest row (name + its dim subtitle) so targets and the cwd
+    // hint aren't truncated the moment they matter.
+    let cwd = invoking_cwd();
+    let (n_hosts, widest) = match load_config(&env.config_search) {
+        Ok(c) => {
+            let w = c
+                .hosts
+                .iter()
+                .map(|h| h.name.len() + h.target.len() + 12)
+                .chain(cwd.iter().map(|c| tilde(c).len() + 22))
+                .max()
+                .unwrap_or(0);
+            (c.hosts.len(), w)
+        }
+        Err(_) => (0, 0),
+    };
     let mut params = json!({
         "plugin_id": "mirror",
         "entrypoint": "pick-host",
         "placement": "popup",
-        "width": 44,
+        "width": widest.clamp(44, 72),
         "height": (n_hosts + 8).max(9),
         "focus": true,
         "env": {},
     });
-    if let Some(cwd) = invoking_cwd() {
+    if let Some(cwd) = cwd {
         params["env"][CWD_ENV] = json!(cwd);
     }
     // herdr shows one popup at a time. Whatever holds the slot — an earlier
@@ -123,17 +138,48 @@ fn invoking_cwd() -> Option<String> {
     (!cwd.ends_with("/.mirror-pane")).then_some(cwd)
 }
 
+/// One menu line: the pickable name plus a dim subtitle (the cwd the local
+/// workspace would inherit; a host's ssh target and default marker).
+struct Row {
+    main: String,
+    sub: String,
+}
+
+/// `$HOME/...` → `~/...` for display.
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
+}
+
 /// Popup leg: draw the menu, take one choice, create, exit. Sync on purpose —
 /// the menu is a blocking keyboard loop; only the create at the end is async.
 pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
     // a broken hosts.toml must not brick the picker: local creation needs no
     // hosts, so degrade to a local-only menu and show why
-    let (hosts, config_note) = match load_config(&env.config_search) {
-        Ok(c) => (c.hosts, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
+    let (hosts, default_host, config_note) = match load_config(&env.config_search) {
+        Ok(c) => {
+            let d = c.default_host().map(|h| h.name.clone());
+            (c.hosts, d, None)
+        }
+        Err(e) => (Vec::new(), None, Some(e.to_string())),
     };
-    let mut rows = vec!["this machine".to_string()];
-    rows.extend(hosts.iter().map(|h| h.name.clone()));
+    let local_cwd = std::env::var(CWD_ENV).ok().filter(|s| !s.is_empty());
+    let mut rows = vec![Row {
+        main: "this machine".into(),
+        sub: local_cwd.as_deref().map(tilde).unwrap_or_default(),
+    }];
+    for h in &hosts {
+        let mut sub = if h.target != h.name { h.target.clone() } else { String::new() };
+        if hosts.len() > 1 && Some(&h.name) == default_host.as_ref() {
+            if !sub.is_empty() {
+                sub.push(' ');
+            }
+            sub.push_str("(default)");
+        }
+        rows.push(Row { main: h.name.clone(), sub });
+    }
 
     let choice = run_menu(&rows, config_note.as_deref())?;
     let outcome = match choice {
@@ -149,7 +195,7 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
     }
     // the popup vanishes when this process exits; hold it long enough to read
     if choice.is_some() {
-        std::thread::sleep(std::time::Duration::from_millis(1400));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
     }
     outcome
 }
@@ -169,19 +215,62 @@ async fn create_remote(env: &Env, host: HostConfig) -> Result<()> {
     println!("connecting to {}...", host.name);
     let mut remote = RemoteHost::new(&host, &env.state_dir);
     let (api, _status) = remote.connect_api().await?;
+
+    // ids of the mirror workspaces that exist NOW, so the one the daemon is
+    // about to build for our create is recognizable as the new arrival
+    let local = ApiClient::connect(&env.local_socket).await?;
+    let known = local_workspace_ids(&local).await.unwrap_or_default();
+
     let res: Value = api.request("workspace.create", json!({ "focus": false })).await?;
     println!(
-        "created workspace {} on {}; mirror follows shortly",
+        "created workspace {} on {} - waiting for its mirror...",
         res.pointer("/workspace/workspace_id").and_then(Value::as_str).unwrap_or("?"),
         host.name
     );
+
+    // Follow through: a local create lands you in the new workspace, so a
+    // remote one should too. Poll for the mirror the daemon builds (labels are
+    // "<host>: <label>") and focus it. Best-effort — a slow mirror just means
+    // the message below and the workspace appearing on its own.
+    let prefix = format!("{}: ", host.name);
+    for _ in 0..16 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let Ok(ws) = local.request("workspace.list", json!({})).await else { continue };
+        let Some(arr) = ws.get("workspaces").and_then(Value::as_array) else { continue };
+        let fresh = arr.iter().find(|w| {
+            let id = w.get("workspace_id").and_then(Value::as_str).unwrap_or("");
+            let label = w.get("label").and_then(Value::as_str).unwrap_or("");
+            !known.contains(id) && label.starts_with(&prefix)
+        });
+        if let Some(w) = fresh {
+            let id = w.get("workspace_id").and_then(Value::as_str).unwrap_or("");
+            let _ = local.request("workspace.focus", json!({ "workspace_id": id })).await;
+            println!("opened {}", w.get("label").and_then(Value::as_str).unwrap_or(id));
+            return Ok(());
+        }
+    }
+    println!("mirror is taking longer than usual; it will appear on its own");
     Ok(())
+}
+
+async fn local_workspace_ids(api: &ApiClient) -> Result<std::collections::HashSet<String>> {
+    let ws: Value = api.request("workspace.list", json!({})).await?;
+    Ok(ws
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.get("workspace_id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 // --- the menu itself -------------------------------------------------------
 
 /// Returns the selected row index, or None on cancel.
-fn run_menu(rows: &[String], note: Option<&str>) -> Result<Option<usize>> {
+fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
     let _raw = RawMode::enable();
     let mut out = std::io::stdout().lock();
     let mut sel = 0usize;
@@ -220,15 +309,27 @@ fn run_menu(rows: &[String], note: Option<&str>) -> Result<Option<usize>> {
     }
 }
 
-fn draw(out: &mut impl Write, rows: &[String], sel: usize, note: Option<&str>) {
+fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
+    let cols = term_cols();
+    let name_w = rows.iter().map(|r| r.main.len()).max().unwrap_or(0);
     let _ = out.write_all(b"\x1b[2J\x1b[H");
     let _ = write!(out, "\r\n  \x1b[1mNew workspace on...\x1b[0m\r\n\r\n");
     for (i, row) in rows.iter().enumerate() {
+        // "  ❯ 1 name   sub" — name column aligned so the subs line up; the
+        // sub is dimmed and truncated to the popup width
+        let sub_room = cols.saturating_sub(name_w + 10);
+        let sub: String = row.sub.chars().take(sub_room).collect();
         if i == sel {
-            let _ = write!(out, "  \x1b[7m > {} {}\x1b[0m\r\n", i + 1, row);
+            let _ = write!(
+                out,
+                "  \x1b[7;1m > {} {:name_w$} \x1b[0m\x1b[2m  {}\x1b[0m\r\n",
+                i + 1,
+                row.main,
+                sub
+            );
         } else {
-            let _ = write!(out, "    {} {}\r\n", i + 1, row);
+            let _ = write!(out, "    {} {:name_w$}\x1b[2m   {}\x1b[0m\r\n", i + 1, row.main, sub);
         }
     }
     let _ = write!(out, "\r\n  \x1b[2mup/down move - enter pick - esc cancel\x1b[0m\r\n");
@@ -236,6 +337,16 @@ fn draw(out: &mut impl Write, rows: &[String], sel: usize, note: Option<&str>) {
         let _ = write!(out, "  \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
     }
     let _ = out.flush();
+}
+
+fn term_cols() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    80
 }
 
 fn finish(out: &mut impl Write) {
