@@ -61,16 +61,16 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
     if let Some(cwd) = cwd {
         params["env"][CWD_ENV] = json!(cwd);
     }
-    // herdr shows one popup at a time. Whatever holds the slot — an earlier
-    // picker, some other overlay — close it and take over: the user just asked
-    // for THIS popup, and erroring here surfaces nowhere (action output is
-    // discarded), which reads as a dead key.
+    // herdr shows one popup at a time. If one is open, the invocation is a
+    // TOGGLE: close it and stop. Reopening here instead made the key feel
+    // stuck — "it's still open" — because pressing it again could never
+    // dismiss the picker. If the closed popup was some other overlay, the
+    // next press opens the picker; two presses beat a popup that won't die.
     if let Err(e) = api.request("plugin.pane.open", params.clone()).await {
         if !e.to_string().contains("popup already open") {
             return Err(e);
         }
         api.request("popup.close", json!({})).await?;
-        api.request("plugin.pane.open", params).await?;
     }
     Ok(())
 }
@@ -502,8 +502,10 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
             break;
         }
     }
-    // hide the cursor for the duration; the guard restores it with the tty
-    let _ = out.write_all(b"\x1b[?25l");
+    // hide the cursor and ask for mouse reports: this is OUR pane, nothing to
+    // select in it, so the grab costs nothing and buys click-to-pick. The
+    // guard's Drop releases both with the tty.
+    let _ = out.write_all(b"\x1b[?25l\x1b[?1000h\x1b[?1006h");
 
     loop {
         draw(&mut out, rows, sel, note);
@@ -513,6 +515,15 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
             Key::Digit(d) if (d as usize) <= rows.len() && d >= 1 => {
                 finish(&mut out);
                 return Ok(Some(d as usize - 1));
+            }
+            // a click on an option row picks it outright; anywhere else ignores
+            Key::Click { y } => {
+                if let Some(idx) = (y as usize).checked_sub(FIRST_ROW_Y) {
+                    if idx < rows.len() {
+                        finish(&mut out);
+                        return Ok(Some(idx));
+                    }
+                }
             }
             Key::Enter => {
                 finish(&mut out);
@@ -526,6 +537,10 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
         }
     }
 }
+
+/// 1-based terminal row of the first option line — draw() emits two blank
+/// lines, the title, the rule, and one more blank line above the options.
+const FIRST_ROW_Y: usize = 6;
 
 fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
@@ -553,7 +568,7 @@ fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
         }
     }
     let _ = write!(out, "\r\n    \x1b[2m{}\x1b[0m\r\n", "─".repeat(rule_w));
-    let _ = write!(out, "    \x1b[2mup/down move - enter pick - esc cancel\x1b[0m\r\n");
+    let _ = write!(out, "    \x1b[2mclick or enter pick - up/down move - esc cancel\x1b[0m\r\n");
     if let Some(n) = note {
         let _ = write!(out, "    \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
     }
@@ -573,6 +588,13 @@ fn term_cols() -> usize {
 fn finish(out: &mut impl Write) {
     let _ = out.write_all(b"\x1b[2J\x1b[H\x1b[?25h\r\n  ");
     let _ = out.flush();
+    // swallow whatever trails the deciding event (a click's release sequence,
+    // a queued repeat) so it can't leak into the pane as typed garbage
+    while stdin_readable(0) {
+        if read_byte().is_err() {
+            break;
+        }
+    }
 }
 
 enum Key {
@@ -581,6 +603,7 @@ enum Key {
     Enter,
     Cancel,
     Digit(u8),
+    Click { y: u32 },
     Other,
 }
 
@@ -624,16 +647,32 @@ fn read_key() -> Result<Key> {
                 // CSI: parameter/intermediate bytes end at a final 0x40-0x7E
                 b'[' => {
                     let mut fin = 0u8;
+                    let mut params = Vec::new();
                     while stdin_readable(60) {
                         let b = read_byte()?;
                         if (0x40..=0x7e).contains(&b) {
                             fin = b;
                             break;
                         }
+                        params.push(b);
                     }
                     match fin {
                         b'A' => Key::Up,
                         b'B' => Key::Down,
+                        // SGR mouse `<btn;x;y` + M(press)/m(release): wheel
+                        // moves the selection, a left-press picks by row
+                        b'M' | b'm' if params.first() == Some(&b'<') => {
+                            let f: Vec<u32> = String::from_utf8_lossy(&params[1..])
+                                .split(';')
+                                .filter_map(|s| s.parse().ok())
+                                .collect();
+                            match (f.first(), f.get(2), fin) {
+                                (Some(64), _, b'M') => Key::Up,
+                                (Some(65), _, b'M') => Key::Down,
+                                (Some(0), Some(&y), b'M') => Key::Click { y },
+                                _ => Key::Other,
+                            }
+                        }
                         _ => Key::Other,
                     }
                 }
@@ -686,7 +725,7 @@ impl Drop for RawMode {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
             }
         }
-        // cursor back on even if finish() was never reached
-        let _ = std::io::stdout().write_all(b"\x1b[?25h");
+        // cursor back on and mouse released even if finish() was never reached
+        let _ = std::io::stdout().write_all(b"\x1b[?1000l\x1b[?25h");
     }
 }
