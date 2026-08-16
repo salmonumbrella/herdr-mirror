@@ -121,12 +121,15 @@ type = "plugin_action"
 command = "mirror.new-workspace-pick"
 ```
 
-The sidebar's mouse "+" can't be rebound (herdr has no button action
-setting), so the picker catches it after the fact: a native create from
-inside a mirror lands as a one-pane workspace in the `.mirror-pane`
-placeholder, and a `workspace.created` hook recognizes exactly that shape,
-closes it, and opens the picker instead. Native creation from any normal
-workspace is untouched.
+The mouse buttons and native keys can't be rebound to any of this (herdr has
+no button action setting), so creation hooks catch them after the fact: a
+native create from inside a mirror lands in the `.mirror-pane` placeholder,
+and `workspace.created` / `tab.created` / `pane.created` hooks recognize
+exactly that shape, close the botched object, and do what was meant — a
+workspace gets the picker; a tab or split is recreated on the remote (cwd
+inherited from the mirrored pane, the tab's mirror focused when it arrives).
+Native creation from any normal workspace is untouched, and
+`intercept_native_create = false` turns all of it off.
 
 **One key for both worlds** — outside a mirror they degrade to the plain local
 action instead of erroring, so one binding can replace the native key entirely.

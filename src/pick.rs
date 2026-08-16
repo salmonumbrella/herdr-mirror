@@ -41,8 +41,8 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
             let w = c
                 .hosts
                 .iter()
-                .map(|h| h.name.len() + h.target.len() + 12)
-                .chain(cwd.iter().map(|c| tilde(c).len() + 22))
+                .map(|h| h.name.len() + h.target.len() + 16)
+                .chain(cwd.iter().map(|c| tilde(c).len() + 26))
                 .max()
                 .unwrap_or(0);
             (c.hosts.len(), w)
@@ -53,8 +53,8 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
         "plugin_id": "mirror",
         "entrypoint": "pick-host",
         "placement": "popup",
-        "width": widest.clamp(44, 72),
-        "height": (n_hosts + 8).max(9),
+        "width": widest.clamp(58, 90),
+        "height": (n_hosts + 11).max(12),
         "focus": true,
         "env": {},
     });
@@ -75,29 +75,56 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// workspace.created hook: turn a native "new workspace" that landed in the
-/// `.mirror-pane` placeholder into the picker. herdr can't rebind the
-/// sidebar's mouse button (no *_button_plugin_action exists), so the botched
-/// workspace that click produces from inside a mirror — focused, one bare
-/// agentless pane, cwd = the placeholder — is recognized, closed, and
-/// replaced by the popup. Every guard matters: daemon-built mirrors carry a
-/// "host: label" name and are created unfocused, and the focused requirement
-/// is what keeps this from eating older placeholder workspaces the user
-/// merely clicks on.
-pub async fn intercept(env: Env) -> Result<()> {
+/// Creation hooks: turn a native create that landed in the `.mirror-pane`
+/// placeholder into the thing the user actually wanted. herdr can't rebind
+/// the sidebar's mouse buttons (no *_button_plugin_action exists), so native
+/// creation from inside a mirror inherits the focused pane's local cwd — the
+/// placeholder — and produces a bare local object nobody asked for. Each
+/// event handles its own shape, so no cross-event locking is needed:
+///
+///   workspace.created  junk workspace (label .mirror-pane, focused, one bare
+///                      pane) → close it, open the host picker
+///   tab.created        junk tab in a MIRROR workspace (active tab not in the
+///                      id map, one bare pane) → close it, create the tab on
+///                      the remote and focus its mirror when it arrives
+///   pane.created       junk split beside a mirrored pane (pane not in the
+///                      map, its tab IS mapped) → close it, split the remote
+///                      pane the same direction
+///
+/// A junk TAB also fires pane.created, but its tab is unmapped so the split
+/// arm no-ops; a junk WORKSPACE also fires tab/pane.created, but it is not a
+/// mirror workspace so both arms no-op. Daemon-built mirrors are excluded
+/// everywhere twice over: they are created unfocused, and they ARE in the id
+/// map by the time the settle delay ends.
+pub async fn intercept(env: Env, what: &str) -> Result<()> {
     // opt-out: hosts.toml `intercept_native_create = false` leaves native
     // creation alone entirely (an unreadable config keeps the default on —
     // the guards below can't misfire without a mirror placeholder to match)
-    if let Ok(c) = load_config(&env.config_search) {
+    let config = load_config(&env.config_search).ok();
+    if let Some(c) = &config {
         if !c.intercept_native_create {
             return Ok(());
         }
     }
-    // let the create→focus pair settle before looking
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // let the create→focus pair (and the daemon's map write) settle
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let placeholder = env.state_dir.join(".mirror-pane");
     let api = ApiClient::connect(&env.local_socket).await?;
 
+    match what {
+        "tab" | "pane" => {
+            let Some(config) = config else { return Ok(()) };
+            intercept_in_mirror(&env, &api, &config, &placeholder, what).await
+        }
+        _ => intercept_workspace(&env, &api, &placeholder).await,
+    }
+}
+
+async fn intercept_workspace(
+    env: &Env,
+    api: &ApiClient,
+    placeholder: &std::path::Path,
+) -> Result<()> {
     let ws: Value = api.request("workspace.list", json!({})).await?;
     let Some(w) = ws
         .get("workspaces")
@@ -119,14 +146,197 @@ pub async fn intercept(env: Env) -> Result<()> {
     }) else {
         return Ok(());
     };
-    let is_bare = p.get("agent").map_or(true, Value::is_null)
-        && p.get("cwd").and_then(Value::as_str) == placeholder.to_str();
-    if !is_bare {
+    if !is_bare_placeholder(p, placeholder) {
         return Ok(());
     }
 
     api.request("workspace.close", json!({ "workspace_id": ws_id })).await?;
-    open_popup(&api, &env).await
+    open_popup(api, env).await
+}
+
+fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
+    pane.get("agent").map_or(true, Value::is_null)
+        && pane.get("cwd").and_then(Value::as_str) == placeholder.to_str()
+}
+
+/// The tab and split arms share their discovery: the focused workspace must
+/// be a live mirror, and the junk object is whatever holds a bare placeholder
+/// pane that the id map does not know.
+async fn intercept_in_mirror(
+    env: &Env,
+    api: &ApiClient,
+    config: &crate::config::MirrorConfig,
+    placeholder: &std::path::Path,
+    what: &str,
+) -> Result<()> {
+    let ws: Value = api.request("workspace.list", json!({})).await?;
+    let Some(w) = ws
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|w| w.get("focused").and_then(Value::as_bool) == Some(true)))
+    else {
+        return Ok(());
+    };
+    let Some(ws_id) = w.get("workspace_id").and_then(Value::as_str) else { return Ok(()) };
+
+    // is the focused workspace a live mirror, and of which host?
+    let mut mapped_tabs: std::collections::HashSet<String> = Default::default();
+    let mut mapped_panes: std::collections::HashSet<String> = Default::default();
+    let mut host = None;
+    for h in &config.hosts {
+        let state = crate::state::load_state(&env.state_dir, &h.name);
+        let is_ours = state
+            .workspaces
+            .values()
+            .any(|e| e.local_id == ws_id && !e.is_tombstoned());
+        if is_ours {
+            mapped_tabs = state.tabs.values().map(|e| e.local_id.clone()).collect();
+            mapped_panes = state.panes.values().map(|e| e.local_id.clone()).collect();
+            // the root tab of a fresh mirror is mapped under the workspace,
+            // not the tab table — count it as known
+            mapped_tabs.extend(
+                state.workspaces.values().filter_map(|e| e.root_tab_local_id.clone()),
+            );
+            host = Some(h.clone());
+            break;
+        }
+    }
+    if host.is_none() {
+        return Ok(());
+    }
+
+    let panes: Value = api.request("pane.list", json!({})).await?;
+    let all: Vec<&Value> = panes
+        .get("panes")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter(|p| p.get("workspace_id").and_then(Value::as_str) == Some(ws_id)).collect())
+        .unwrap_or_default();
+
+    // the junk: a bare placeholder pane the map doesn't know
+    let junk = all.iter().find(|p| {
+        let pid = p.get("pane_id").and_then(Value::as_str).unwrap_or("");
+        !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder)
+    });
+    let Some(junk) = junk else { return Ok(()) };
+    let junk_id = junk.get("pane_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let junk_tab = junk.get("tab_id").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // a mirrored sibling to anchor the remote action's context on
+    let sibling_in = |tab_only: bool| {
+        all.iter()
+            .find(|p| {
+                let pid = p.get("pane_id").and_then(Value::as_str).unwrap_or("");
+                mapped_panes.contains(pid)
+                    && (!tab_only || p.get("tab_id").and_then(Value::as_str) == Some(junk_tab.as_str()))
+            })
+            .and_then(|p| p.get("pane_id").and_then(Value::as_str))
+            .map(str::to_string)
+    };
+
+    // Runaway breaker: acting more than once per few seconds means the
+    // guards misjudged something (say, a daemon map write outran the settle
+    // delay) and we are eating our own mirror-back objects. One action per
+    // window caps any such feedback loop at nuisance level.
+    let marker = env.state_dir.join("intercept-acted");
+    let recently = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e < std::time::Duration::from_secs(4));
+    if recently {
+        return Ok(());
+    }
+    let mark = || {
+        let _ = std::fs::write(&marker, b"");
+    };
+
+    match what {
+        // native new tab: the junk pane's tab is NOT a mirror tab
+        "tab" if !mapped_tabs.contains(&junk_tab) => {
+            let Some(anchor) = sibling_in(false) else { return Ok(()) };
+            let before = tab_ids_in(api, ws_id).await;
+            mark();
+            api.request("tab.close", json!({ "tab_id": junk_tab })).await?;
+            run_remote(env, ws_id, &anchor, "tab", None).await?;
+            focus_new_tab(api, ws_id, &before).await;
+            Ok(())
+        }
+        // native split: the junk pane sits INSIDE a mirror tab
+        "pane" if mapped_tabs.contains(&junk_tab) => {
+            let Some(anchor) = sibling_in(true) else { return Ok(()) };
+            // native splits place the new pane right of / below its origin,
+            // so the origin's position relative to the junk names the direction
+            let dir = match api
+                .request("pane.neighbor", json!({ "pane_id": junk_id, "direction": "left" }))
+                .await
+            {
+                Ok(n) if n.pointer("/pane/pane_id").and_then(Value::as_str) == Some(anchor.as_str()) => "right",
+                _ => match api
+                    .request("pane.neighbor", json!({ "pane_id": junk_id, "direction": "up" }))
+                    .await
+                {
+                    Ok(n) if n.pointer("/pane/pane_id").and_then(Value::as_str) == Some(anchor.as_str()) => "down",
+                    _ => "right",
+                },
+            };
+            mark();
+            api.request("pane.close", json!({ "pane_id": junk_id })).await?;
+            run_remote(env, ws_id, &anchor, "split", Some(dir)).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Hand the remote-create machinery a context pointing at the mirror, exactly
+/// as if the matching plugin action had been invoked from that pane.
+async fn run_remote(
+    env: &Env,
+    ws_id: &str,
+    pane_id: &str,
+    kind: &str,
+    direction: Option<&str>,
+) -> Result<()> {
+    std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON"); // would carry the junk pane
+    std::env::set_var("HERDR_ACTIVE_WORKSPACE_ID", ws_id);
+    std::env::set_var("HERDR_ACTIVE_PANE_ID", pane_id);
+    std::env::remove_var("HERDR_ACTIVE_PANE_CWD");
+    let env2 = Env {
+        config_search: env.config_search.clone(),
+        state_dir: env.state_dir.clone(),
+        local_socket: env.local_socket.clone(),
+    };
+    crate::remote_action::run_cmd(env2, kind, direction).await
+}
+
+async fn tab_ids_in(api: &ApiClient, ws_id: &str) -> std::collections::HashSet<String> {
+    let Ok(t) = api.request("tab.list", json!({})).await else { return Default::default() };
+    t.get("tabs")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|t| t.get("workspace_id").and_then(Value::as_str) == Some(ws_id))
+                .filter_map(|t| t.get("tab_id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The user pressed "new tab" and expects to land in it; the daemon mirrors
+/// the remote tab back unfocused, so follow it. Best-effort with a ceiling.
+async fn focus_new_tab(
+    api: &ApiClient,
+    ws_id: &str,
+    before: &std::collections::HashSet<String>,
+) {
+    for _ in 0..16 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let now = tab_ids_in(api, ws_id).await;
+        if let Some(fresh) = now.iter().find(|id| !before.contains(*id)) {
+            let _ = api.request("tab.focus", json!({ "tab_id": fresh })).await;
+            return;
+        }
+    }
 }
 
 /// The invoking pane's cwd, from the shell-binding env var or the
@@ -321,28 +531,31 @@ fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
     let cols = term_cols();
     let name_w = rows.iter().map(|r| r.main.len()).max().unwrap_or(0);
+    let rule_w = cols.saturating_sub(8).min(60);
     let _ = out.write_all(b"\x1b[2J\x1b[H");
-    let _ = write!(out, "\r\n  \x1b[1mNew workspace on...\x1b[0m\r\n\r\n");
+    let _ = write!(out, "\r\n\r\n    \x1b[1mNew workspace on...\x1b[0m\r\n");
+    let _ = write!(out, "    \x1b[2m{}\x1b[0m\r\n\r\n", "─".repeat(rule_w));
     for (i, row) in rows.iter().enumerate() {
-        // "  ❯ 1 name   sub" — name column aligned so the subs line up; the
+        // "    ❯ 1 name   sub" — name column aligned so the subs line up; the
         // sub is dimmed and truncated to the popup width
-        let sub_room = cols.saturating_sub(name_w + 10);
+        let sub_room = cols.saturating_sub(name_w + 14);
         let sub: String = row.sub.chars().take(sub_room).collect();
         if i == sel {
             let _ = write!(
                 out,
-                "  \x1b[7;1m > {} {:name_w$} \x1b[0m\x1b[2m  {}\x1b[0m\r\n",
+                "    \x1b[7;1m > {} {:name_w$} \x1b[0m\x1b[2m  {}\x1b[0m\r\n",
                 i + 1,
                 row.main,
                 sub
             );
         } else {
-            let _ = write!(out, "    {} {:name_w$}\x1b[2m   {}\x1b[0m\r\n", i + 1, row.main, sub);
+            let _ = write!(out, "      {} {:name_w$}\x1b[2m   {}\x1b[0m\r\n", i + 1, row.main, sub);
         }
     }
-    let _ = write!(out, "\r\n  \x1b[2mup/down move - enter pick - esc cancel\x1b[0m\r\n");
+    let _ = write!(out, "\r\n    \x1b[2m{}\x1b[0m\r\n", "─".repeat(rule_w));
+    let _ = write!(out, "    \x1b[2mup/down move - enter pick - esc cancel\x1b[0m\r\n");
     if let Some(n) = note {
-        let _ = write!(out, "  \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
+        let _ = write!(out, "    \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
     }
     let _ = out.flush();
 }

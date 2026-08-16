@@ -90,10 +90,19 @@ command = ["./target/release/herdr-mirror", "teardown"]
 on = "workspace.focused"
 command = ["./target/release/herdr-mirror", "ensure"]
 
-# The mouse path to the picker: herdr can't rebind the sidebar's "+" button,
-# but a native create from inside a mirror lands in the .mirror-pane
-# placeholder — this hook recognizes that workspace, closes it, and opens the
-# picker instead. No-op for every other creation. See src/pick.rs::intercept.
+# The mouse path to the picker: herdr can't rebind the sidebar's buttons, but
+# a native create from inside a mirror lands in the .mirror-pane placeholder —
+# these hooks recognize the botched object, close it, and do what the user
+# meant: workspaces get the host picker; tabs and splits are recreated on the
+# remote. No-op for every other creation. See src/pick.rs::intercept.
 [[events]]
 on = "workspace.created"
-command = ["./target/release/herdr-mirror", "intercept-new"]
+command = ["./target/release/herdr-mirror", "intercept-new", "workspace"]
+
+[[events]]
+on = "tab.created"
+command = ["./target/release/herdr-mirror", "intercept-new", "tab"]
+
+[[events]]
+on = "pane.created"
+command = ["./target/release/herdr-mirror", "intercept-new", "pane"]
