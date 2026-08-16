@@ -155,7 +155,7 @@ async fn intercept_workspace(
 }
 
 fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
-    pane.get("agent").map_or(true, Value::is_null)
+    pane.get("agent").is_none_or(Value::is_null)
         && pane.get("cwd").and_then(Value::as_str) == placeholder.to_str()
 }
 
