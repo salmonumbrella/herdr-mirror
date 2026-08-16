@@ -314,6 +314,12 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# intercept_native_create = true
+                         # default. A native workspace create that lands in the
+                         # .mirror-pane placeholder (the sidebar's unrebindable
+                         # "+" clicked from inside a mirror) is closed and
+                         # replaced by the host picker. Set false to leave
+                         # native creation alone.
 
 [hosts.work]
 target = "work"

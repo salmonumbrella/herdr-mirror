@@ -85,6 +85,14 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
 /// is what keeps this from eating older placeholder workspaces the user
 /// merely clicks on.
 pub async fn intercept(env: Env) -> Result<()> {
+    // opt-out: hosts.toml `intercept_native_create = false` leaves native
+    // creation alone entirely (an unreadable config keeps the default on —
+    // the guards below can't misfire without a mirror placeholder to match)
+    if let Ok(c) = load_config(&env.config_search) {
+        if !c.intercept_native_create {
+            return Ok(());
+        }
+    }
     // let the create→focus pair settle before looking
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let placeholder = env.state_dir.join(".mirror-pane");
