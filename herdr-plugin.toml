@@ -41,6 +41,21 @@ title = "Mirror: new workspace"
 description = "New workspace on the remote host (the invoking mirror's host, else hosts.toml default_host)"
 command = ["./target/release/herdr-mirror", "remote-workspace"]
 
+# The picker popup. The [[panes]] entry is the interactive surface (actions
+# run headless with output discarded); the action below summons it via
+# plugin.pane.open. See src/pick.rs.
+[[panes]]
+id = "pick-host"
+title = "New workspace"
+placement = "popup"
+command = ["./target/release/herdr-mirror", "pick-workspace", "--menu"]
+
+[[actions]]
+id = "new-workspace-pick"
+title = "Mirror: new workspace — pick host"
+description = "Pop up a picker: create the new workspace on this machine or on a configured host"
+command = ["./target/release/herdr-mirror", "pick-workspace"]
+
 [[actions]]
 id = "remote-new-tab"
 title = "Mirror: new tab"

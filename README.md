@@ -102,6 +102,21 @@ same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
 
+**Or ask every time** — the **new-workspace-pick** action pops up a picker
+listing *this machine* plus every host in `hosts.toml`; the new workspace is
+created wherever you choose. Arrows or `j`/`k` move, digits pick directly,
+`Enter` confirms, `Esc` cancels. Local creation inherits the invoking pane's
+cwd (never the `.mirror-pane` placeholder); remote creation uses the remote's
+default, like `remote-new-workspace` outside a mirror. Bound over the native
+new-workspace key it turns "new workspace" into a where-do-you-want-it prompt:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+n"         # shadows native new_workspace
+type = "plugin_action"
+command = "mirror.new-workspace-pick"
+```
+
 **One key for both worlds** — outside a mirror they degrade to the plain local
 action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`

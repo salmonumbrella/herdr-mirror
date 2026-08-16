@@ -5,6 +5,7 @@
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror hide|show [host]       # toggle a connection's mirrors out of view
+//   herdr-mirror pick-workspace [--menu]            # popup host picker
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
@@ -22,6 +23,7 @@ mod layout_sync;
 mod mirror;
 mod pane;
 mod paste;
+mod pick;
 mod predict;
 mod remote;
 mod remote_action;
@@ -93,6 +95,13 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }
+        "pick-workspace" => {
+            if rest.iter().any(|a| a == "--menu") {
+                pick::menu(rt, Env::resolve()?)
+            } else {
+                rt.block_on(pick::summon(Env::resolve()?))
+            }
+        }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
         "remote-split" => rt.block_on(remote_action::run_cmd(
@@ -121,7 +130,8 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

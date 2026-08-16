@@ -1,0 +1,310 @@
+// Host picker for new workspaces: `pick-workspace` (the plugin action) opens
+// a popup plugin pane running `pick-workspace --menu`; the menu offers this
+// machine plus every host in hosts.toml and creates the workspace where the
+// user says.
+//
+// Two processes because a plugin pane is the only interactive surface a
+// plugin gets: the action itself runs headless with its output discarded, so
+// the summon leg only asks herdr for the popup and exits, and everything the
+// user sees happens in the popup process.
+//
+// The summon leg forwards the invoking pane's cwd through the popup's
+// environment (HERDR_MIRROR_PICK_CWD): the popup's own cwd is the plugin
+// root, which would be a useless inheritance for the new local workspace.
+// Remote creation passes no cwd at all, matching `remote-workspace` invoked
+// outside a mirror — the remote's default is right, local paths are not.
+
+use std::io::Write;
+
+use serde_json::{json, Value};
+
+use crate::api::ApiClient;
+use crate::config::{load_config, HostConfig};
+use crate::remote::RemoteHost;
+use crate::util::{Env, Result};
+
+const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
+
+/// Plugin-action leg: open the popup that runs the menu below.
+pub async fn summon(env: Env) -> Result<()> {
+    let api = ApiClient::connect(&env.local_socket).await?;
+    // size the popup to its content: options + title + hints + border
+    let n_hosts = load_config(&env.config_search).map(|c| c.hosts.len()).unwrap_or(0);
+    let mut params = json!({
+        "plugin_id": "mirror",
+        "entrypoint": "pick-host",
+        "placement": "popup",
+        "width": 44,
+        "height": (n_hosts + 8).max(9),
+        "focus": true,
+        "env": {},
+    });
+    if let Some(cwd) = invoking_cwd() {
+        params["env"][CWD_ENV] = json!(cwd);
+    }
+    // herdr shows one popup at a time. Whatever holds the slot — an earlier
+    // picker, some other overlay — close it and take over: the user just asked
+    // for THIS popup, and erroring here surfaces nowhere (action output is
+    // discarded), which reads as a dead key.
+    if let Err(e) = api.request("plugin.pane.open", params.clone()).await {
+        if !e.to_string().contains("popup already open") {
+            return Err(e);
+        }
+        api.request("popup.close", json!({})).await?;
+        api.request("plugin.pane.open", params).await?;
+    }
+    Ok(())
+}
+
+/// The invoking pane's cwd, from the shell-binding env var or the
+/// plugin-action context JSON — the same two sources remote_action reads.
+/// A mirror pane's local cwd is the `.mirror-pane` placeholder; inheriting
+/// that would drop the new local workspace into an empty decoy dir, so it's
+/// treated as no cwd at all.
+fn invoking_cwd() -> Option<String> {
+    let cwd = std::env::var("HERDR_ACTIVE_PANE_CWD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+            let v: Value = serde_json::from_str(&ctx).ok()?;
+            v.get("focused_pane_cwd").and_then(Value::as_str).map(str::to_string)
+        })?;
+    (!cwd.ends_with("/.mirror-pane")).then_some(cwd)
+}
+
+/// Popup leg: draw the menu, take one choice, create, exit. Sync on purpose —
+/// the menu is a blocking keyboard loop; only the create at the end is async.
+pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
+    // a broken hosts.toml must not brick the picker: local creation needs no
+    // hosts, so degrade to a local-only menu and show why
+    let (hosts, config_note) = match load_config(&env.config_search) {
+        Ok(c) => (c.hosts, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let mut rows = vec!["this machine".to_string()];
+    rows.extend(hosts.iter().map(|h| h.name.clone()));
+
+    let choice = run_menu(&rows, config_note.as_deref())?;
+    let outcome = match choice {
+        None => {
+            println!("cancelled");
+            Ok(())
+        }
+        Some(0) => rt.block_on(create_local(&env)),
+        Some(i) => rt.block_on(create_remote(&env, hosts[i - 1].clone())),
+    };
+    if let Err(e) = &outcome {
+        println!("failed: {e}");
+    }
+    // the popup vanishes when this process exits; hold it long enough to read
+    if choice.is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(1400));
+    }
+    outcome
+}
+
+async fn create_local(env: &Env) -> Result<()> {
+    let api = ApiClient::connect(&env.local_socket).await?;
+    let cwd = std::env::var(CWD_ENV).ok().filter(|s| !s.is_empty());
+    let res: Value = api.request("workspace.create", json!({ "cwd": cwd, "focus": true })).await?;
+    println!(
+        "created local workspace {}",
+        res.pointer("/workspace/workspace_id").and_then(Value::as_str).unwrap_or("?")
+    );
+    Ok(())
+}
+
+async fn create_remote(env: &Env, host: HostConfig) -> Result<()> {
+    println!("connecting to {}...", host.name);
+    let mut remote = RemoteHost::new(&host, &env.state_dir);
+    let (api, _status) = remote.connect_api().await?;
+    let res: Value = api.request("workspace.create", json!({ "focus": false })).await?;
+    println!(
+        "created workspace {} on {}; mirror follows shortly",
+        res.pointer("/workspace/workspace_id").and_then(Value::as_str).unwrap_or("?"),
+        host.name
+    );
+    Ok(())
+}
+
+// --- the menu itself -------------------------------------------------------
+
+/// Returns the selected row index, or None on cancel.
+fn run_menu(rows: &[String], note: Option<&str>) -> Result<Option<usize>> {
+    let _raw = RawMode::enable();
+    let mut out = std::io::stdout().lock();
+    let mut sel = 0usize;
+    // Drain whatever is already buffered on stdin before the first draw: the
+    // shell prompt that ran just before us may have queried the terminal
+    // (cursor position, device attributes), and the response races into our
+    // raw-mode read. Nothing buffered at this instant can be the user's
+    // answer — the menu hasn't been shown yet.
+    while stdin_readable(0) {
+        if read_byte().is_err() {
+            break;
+        }
+    }
+    // hide the cursor for the duration; the guard restores it with the tty
+    let _ = out.write_all(b"\x1b[?25l");
+
+    loop {
+        draw(&mut out, rows, sel, note);
+        match read_key()? {
+            Key::Up => sel = sel.checked_sub(1).unwrap_or(rows.len() - 1),
+            Key::Down => sel = (sel + 1) % rows.len(),
+            Key::Digit(d) if (d as usize) <= rows.len() && d >= 1 => {
+                finish(&mut out);
+                return Ok(Some(d as usize - 1));
+            }
+            Key::Enter => {
+                finish(&mut out);
+                return Ok(Some(sel));
+            }
+            Key::Cancel => {
+                finish(&mut out);
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw(out: &mut impl Write, rows: &[String], sel: usize, note: Option<&str>) {
+    // full redraw each keypress: the popup is tiny and this keeps it stateless
+    let _ = out.write_all(b"\x1b[2J\x1b[H");
+    let _ = write!(out, "\r\n  \x1b[1mNew workspace on...\x1b[0m\r\n\r\n");
+    for (i, row) in rows.iter().enumerate() {
+        if i == sel {
+            let _ = write!(out, "  \x1b[7m > {} {}\x1b[0m\r\n", i + 1, row);
+        } else {
+            let _ = write!(out, "    {} {}\r\n", i + 1, row);
+        }
+    }
+    let _ = write!(out, "\r\n  \x1b[2mup/down move - enter pick - esc cancel\x1b[0m\r\n");
+    if let Some(n) = note {
+        let _ = write!(out, "  \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
+    }
+    let _ = out.flush();
+}
+
+fn finish(out: &mut impl Write) {
+    let _ = out.write_all(b"\x1b[2J\x1b[H\x1b[?25h\r\n  ");
+    let _ = out.flush();
+}
+
+enum Key {
+    Up,
+    Down,
+    Enter,
+    Cancel,
+    Digit(u8),
+    Other,
+}
+
+/// One byte straight off fd 0. NOT std::io::stdin(): that handle buffers, so
+/// its first read swallows an arrow key's `[B` tail into userspace where the
+/// poll() below can't see it — turning every arrow into a bare-ESC cancel.
+fn read_byte() -> Result<u8> {
+    let mut b = 0u8;
+    loop {
+        let n = unsafe { libc::read(libc::STDIN_FILENO, &mut b as *mut u8 as *mut libc::c_void, 1) };
+        match n {
+            1 => return Ok(b),
+            0 => return Err(crate::util::err("stdin closed")),
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return Err(std::io::Error::last_os_error().into()),
+        }
+    }
+}
+
+/// One keypress from raw stdin. A lone ESC cancels; ESC [ A/B are arrows —
+/// told apart by polling for the follow-up byte instead of blocking on it.
+///
+/// Escape sequences are consumed WHOLE. The terminal answers queries (cursor
+/// position, device attributes) on this same stdin, and a parser that takes a
+/// fixed two bytes after ESC leaves the tail of `ESC [ 12 ; 34 R` behind —
+/// where the digits then read as direct menu selections. That is not
+/// hypothetical: the shell prompt's own query response raced the first draw
+/// and "picked" a host on its own.
+fn read_key() -> Result<Key> {
+    Ok(match read_byte()? {
+        b'\r' | b'\n' => Key::Enter,
+        b'q' | 0x03 => Key::Cancel, // q, ctrl+c
+        b'k' => Key::Up,
+        b'j' => Key::Down,
+        d @ b'1'..=b'9' => Key::Digit(d - b'0'),
+        0x1b => {
+            if !stdin_readable(300) {
+                return Ok(Key::Cancel); // bare ESC
+            }
+            match read_byte()? {
+                // CSI: parameter/intermediate bytes end at a final 0x40-0x7E
+                b'[' => {
+                    let mut fin = 0u8;
+                    while stdin_readable(60) {
+                        let b = read_byte()?;
+                        if (0x40..=0x7e).contains(&b) {
+                            fin = b;
+                            break;
+                        }
+                    }
+                    match fin {
+                        b'A' => Key::Up,
+                        b'B' => Key::Down,
+                        _ => Key::Other,
+                    }
+                }
+                // SS3 (application cursor keys): one final byte
+                b'O' => match if stdin_readable(60) { read_byte()? } else { 0 } {
+                    b'A' => Key::Up,
+                    b'B' => Key::Down,
+                    _ => Key::Other,
+                },
+                _ => Key::Other,
+            }
+        }
+        _ => Key::Other,
+    })
+}
+
+/// poll(2) stdin: is a byte already waiting?
+fn stdin_readable(timeout_ms: i32) -> bool {
+    let mut fds = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut fds, 1, timeout_ms) > 0 }
+}
+
+/// Same raw-mode guard as pane.rs, plus Drop: the menu has many exits and
+/// every one of them must give the shell its terminal back.
+struct RawMode {
+    orig: Option<libc::termios>,
+}
+
+impl RawMode {
+    fn enable() -> RawMode {
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+                return RawMode { orig: None };
+            }
+            let mut raw = orig;
+            libc::cfmakeraw(&mut raw);
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
+                return RawMode { orig: None };
+            }
+            RawMode { orig: Some(orig) }
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if let Some(orig) = &self.orig {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
+            }
+        }
+        // cursor back on even if finish() was never reached
+        let _ = std::io::stdout().write_all(b"\x1b[?25h");
+    }
+}
