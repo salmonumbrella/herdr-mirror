@@ -94,8 +94,9 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
 /// A junk TAB also fires pane.created, but its tab is unmapped so the split
 /// arm no-ops; a junk WORKSPACE also fires tab/pane.created, but it is not a
 /// mirror workspace so both arms no-op. Daemon-built mirrors are excluded
-/// everywhere twice over: they are created unfocused, and they ARE in the id
-/// map by the time the settle delay ends.
+/// because the daemon persists their map entry the moment each one is
+/// created (see mirror::note_mapped) — the settle delay below is what gives
+/// that write time to land before the map is read.
 pub async fn intercept(env: Env, what: &str) -> Result<()> {
     // opt-out: hosts.toml `intercept_native_create = false` leaves native
     // creation alone entirely (an unreadable config keeps the default on —
@@ -263,28 +264,47 @@ async fn intercept_in_mirror(
         }
         // native split: the junk pane sits INSIDE a mirror tab
         "pane" if mapped_tabs.contains(&junk_tab) => {
-            let Some(anchor) = sibling_in(true) else { return Ok(()) };
-            // native splits place the new pane right of / below its origin,
-            // so the origin's position relative to the junk names the direction
-            let dir = match api
-                .request("pane.neighbor", json!({ "pane_id": junk_id, "direction": "left" }))
-                .await
-            {
-                Ok(n) if n.pointer("/pane/pane_id").and_then(Value::as_str) == Some(anchor.as_str()) => "right",
-                _ => match api
-                    .request("pane.neighbor", json!({ "pane_id": junk_id, "direction": "up" }))
-                    .await
-                {
-                    Ok(n) if n.pointer("/pane/pane_id").and_then(Value::as_str) == Some(anchor.as_str()) => "down",
-                    _ => "right",
+            // The junk's spot in the LOCAL split tree names both the pane the
+            // user actually split and the direction: its parent split's other
+            // child is the origin (nearest leaf first), and the parent's
+            // direction is the one the user picked. Anchoring there — not on
+            // whichever mirrored pane the tab happens to list first — keeps a
+            // split of the tab's Nth pane splitting the Nth REMOTE pane, and
+            // keeps "split down" splitting down in tabs with several panes.
+            let located = junk_origin(api, &junk_tab, &junk_id, &mapped_panes).await;
+            let (anchor, dir) = match located {
+                Some(x) => x,
+                // tree unavailable — fall back to any mirrored pane in the tab
+                None => match sibling_in(true) {
+                    Some(a) => (a, "right".to_string()),
+                    None => return Ok(()),
                 },
             };
             mark();
             api.request("pane.close", json!({ "pane_id": junk_id })).await?;
-            run_remote(env, ws_id, &anchor, "split", Some(dir)).await
+            run_remote(env, ws_id, &anchor, "split", Some(dir.as_str())).await
         }
         _ => Ok(()),
     }
+}
+
+/// The mapped pane the junk split off of, plus the split's direction, read
+/// from the local layout tree: pane.split hangs the new pane and its origin
+/// under a fresh parent split, so `locate_in_layout` on the junk yields that
+/// split's direction (already pane.split vocabulary) and the origin-side
+/// leaves nearest-first — the first mapped one is the pane the user split.
+async fn junk_origin(
+    api: &ApiClient,
+    tab_id: &str,
+    junk_id: &str,
+    mapped_panes: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    let exported = api.request("layout.export", json!({ "tab_id": tab_id })).await.ok()?;
+    let root: crate::mirror::LayoutNode =
+        serde_json::from_value(exported.pointer("/layout/root")?.clone()).ok()?;
+    let (dir, siblings) = crate::mirror::locate_in_layout(&root, junk_id)?;
+    let anchor = siblings.into_iter().find(|s| mapped_panes.contains(s))?;
+    Some((anchor, dir))
 }
 
 /// Hand the remote-create machinery a context pointing at the mirror, exactly
