@@ -756,7 +756,12 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
             t.forget(id);
         }
     }
-    let _ = save_state(&deps.state_dir, &deps.host.name, state);
+    if let Err(e) = save_state(&deps.state_dir, &deps.host.name, state) {
+        // Not cosmetic: this write is what tells the intercept hook these
+        // objects are ours. An unwritable state dir would otherwise leave every
+        // daemon-created pane looking like native junk, silently.
+        deps.log.log(&format!("could not persist map after mapping fresh ids: {e}"));
+    }
 }
 
 /// Returns the post-converge state so callers don't re-read the state file.

@@ -54,7 +54,9 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
         "entrypoint": "pick-host",
         "placement": "popup",
         "width": widest.clamp(58, 90),
-        "height": (n_hosts + 11).max(12),
+        // +2 for herdr's border, +1 so the hint line's trailing newline has
+        // somewhere to go, +1 for the optional hosts.toml note
+        "height": (n_hosts + 13).max(14),
         "focus": true,
         "env": {},
     });
@@ -67,10 +69,21 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
     // dismiss the picker. If the closed popup was some other overlay, the
     // next press opens the picker; two presses beat a popup that won't die.
     if let Err(e) = api.request("plugin.pane.open", params.clone()).await {
-        if !e.to_string().contains("popup already open") {
-            return Err(e);
+        if e.to_string().contains("popup already open") {
+            api.request("popup.close", json!({})).await?;
+            return Ok(());
         }
-        api.request("popup.close", json!({})).await?;
+        // Popup placement (and `popup.close`) arrived in herdr 0.7.4, and we
+        // still support 0.7.2. Rather than raise the floor and lock those users
+        // out of the whole plugin for one presentation detail, retry without it
+        // and take herdr's default. The picker itself is identical either way.
+        let mut fallback = params.clone();
+        if let Some(obj) = fallback.as_object_mut() {
+            obj.remove("placement");
+            obj.remove("width");
+            obj.remove("height");
+        }
+        api.request("plugin.pane.open", fallback).await?;
     }
     Ok(())
 }
@@ -97,27 +110,111 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
 /// because the daemon persists their map entry the moment each one is
 /// created (see mirror::note_mapped) — the settle delay below is what gives
 /// that write time to land before the map is read.
-pub async fn intercept(env: Env, what: &str) -> Result<()> {
-    // opt-out: hosts.toml `intercept_native_create = false` leaves native
-    // creation alone entirely (an unreadable config keeps the default on —
-    // the guards below can't misfire without a mirror placeholder to match)
-    let config = load_config(&env.config_search).ok();
-    if let Some(c) = &config {
-        if !c.intercept_native_create {
-            return Ok(());
+/// Is this pane the daemon's, rather than native junk?
+///
+/// Two independent signals, because neither alone is safe. The map is
+/// authoritative but written *after* the pane exists, so a fresh mirror pane is
+/// briefly unmapped. A running streamer proves ownership outright but only lands
+/// once the typed `exec` has taken. Polling both for a couple of seconds turns a
+/// 250ms race into one with a wide margin, and it costs nothing in the case that
+/// matters: genuine native junk is never mapped and never grows a streamer, so
+/// the wait always expires and we still act.
+async fn settles_as_ours(
+    env: &Env,
+    api: &ApiClient,
+    config: &crate::config::MirrorConfig,
+    pane_id: &str,
+) -> bool {
+    for attempt in 0..8 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        for h in &config.hosts {
+            let state = crate::state::load_state(&env.state_dir, &h.name);
+            if state.panes.values().any(|e| e.local_id == pane_id) {
+                return true;
+            }
+        }
+        if let Ok(v) = api.request("pane.process_info", json!({ "pane_id": pane_id })).await {
+            let running = v
+                .pointer("/process_info/foreground_processes")
+                .and_then(Value::as_array)
+                .is_some_and(|procs| {
+                    procs.iter().any(|p| {
+                        p.get("argv").and_then(Value::as_array).is_some_and(|argv| {
+                            argv.first().and_then(Value::as_str).is_some_and(|e| e.ends_with("herdr-mirror"))
+                                && argv.get(1).and_then(Value::as_str) == Some("pane")
+                        })
+                    })
+                });
+            if running {
+                return true;
+            }
         }
     }
-    // let the create→focus pair (and the daemon's map write) settle
+    false
+}
+
+/// The id of the object this event is actually about.
+///
+/// herdr names it for us (`HERDR_PLUGIN_EVENT_JSON`, with the context vars as a
+/// fallback), so there is no need to guess. Guessing is what the first version
+/// did — it rescanned the focused workspace and closed the first unmapped bare
+/// placeholder pane it found — and that made every leftover pane a target for
+/// every later event, including panes the user was working in.
+fn event_object_id(what: &str) -> Option<String> {
+    let key = match what {
+        "tab" => "tab_id",
+        "pane" => "pane_id",
+        _ => "workspace_id",
+    };
+    if let Ok(raw) = std::env::var("HERDR_PLUGIN_EVENT_JSON") {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            // the envelope is { event, data: { .. } }; accept either shape
+            let found = v
+                .pointer(&format!("/data/{key}"))
+                .or_else(|| v.get(key))
+                .and_then(Value::as_str);
+            if let Some(id) = found {
+                return Some(id.to_string());
+            }
+        }
+    }
+    let var = match what {
+        "tab" => "HERDR_TAB_ID",
+        "pane" => "HERDR_PANE_ID",
+        _ => "HERDR_WORKSPACE_ID",
+    };
+    std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+pub async fn intercept(env: Env, what: &str) -> Result<()> {
+    // Fail CLOSED. This is the opt-out for a feature whose verb is "close
+    // something the user just created", so an unreadable hosts.toml must not
+    // silently re-arm it — which is what returning early on `.ok()` used to do,
+    // since the workspace arm needs no config and ran anyway.
+    let Ok(config) = load_config(&env.config_search) else { return Ok(()) };
+    if !config.intercept_native_create {
+        return Ok(());
+    }
+    // Nothing to recreate the object on if the daemon cannot act: with it
+    // stopped or paused we would close the local tab, create a real one on the
+    // remote, and no mirror would ever come back — the failure being silent
+    // precisely because nothing errored.
+    if crate::daemon::running_pid(&env).is_none() || crate::daemon::is_paused(&env) {
+        return Ok(());
+    }
+    let Some(target) = event_object_id(what) else { return Ok(()) };
+    // let the create→focus pair settle before the first look
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let placeholder = env.state_dir.join(".mirror-pane");
     let api = ApiClient::connect(&env.local_socket).await?;
 
     match what {
         "tab" | "pane" => {
-            let Some(config) = config else { return Ok(()) };
-            intercept_in_mirror(&env, &api, &config, &placeholder, what).await
+            intercept_in_mirror(&env, &api, &config, &placeholder, what, &target).await
         }
-        _ => intercept_workspace(&env, &api, &placeholder).await,
+        _ => intercept_workspace(&env, &api, &placeholder, &target).await,
     }
 }
 
@@ -125,13 +222,13 @@ async fn intercept_workspace(
     env: &Env,
     api: &ApiClient,
     placeholder: &std::path::Path,
+    target: &str,
 ) -> Result<()> {
     let ws: Value = api.request("workspace.list", json!({})).await?;
-    let Some(w) = ws
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().find(|w| w.get("focused").and_then(Value::as_bool) == Some(true)))
-    else {
+    // the workspace the EVENT named, not whatever happens to be focused now
+    let Some(w) = ws.get("workspaces").and_then(Value::as_array).and_then(|a| {
+        a.iter().find(|w| w.get("workspace_id").and_then(Value::as_str) == Some(target))
+    }) else {
         return Ok(());
     };
     if w.get("label").and_then(Value::as_str) != Some(".mirror-pane")
@@ -169,16 +266,27 @@ async fn intercept_in_mirror(
     config: &crate::config::MirrorConfig,
     placeholder: &std::path::Path,
     what: &str,
+    target: &str,
 ) -> Result<()> {
-    let ws: Value = api.request("workspace.list", json!({})).await?;
-    let Some(w) = ws
-        .get("workspaces")
+    let panes_all: Value = api.request("pane.list", json!({})).await?;
+    // Locate the object the EVENT named and take its workspace from there. The
+    // first version used whichever workspace was focused when the hook woke,
+    // which is a different thing entirely once a sibling hook has refocused
+    // something or the user has moved on.
+    let ws_id = panes_all
+        .get("panes")
         .and_then(Value::as_array)
-        .and_then(|a| a.iter().find(|w| w.get("focused").and_then(Value::as_bool) == Some(true)))
-    else {
-        return Ok(());
-    };
-    let Some(ws_id) = w.get("workspace_id").and_then(Value::as_str) else { return Ok(()) };
+        .and_then(|a| {
+            a.iter()
+                .find(|p| {
+                    let key = if what == "tab" { "tab_id" } else { "pane_id" };
+                    p.get(key).and_then(Value::as_str) == Some(target)
+                })
+                .and_then(|p| p.get("workspace_id").and_then(Value::as_str))
+        })
+        .map(str::to_string);
+    let Some(ws_id) = ws_id else { return Ok(()) };
+    let ws_id = ws_id.as_str();
 
     // is the focused workspace a live mirror, and of which host?
     let mut mapped_tabs: std::collections::HashSet<String> = Default::default();
@@ -213,14 +321,29 @@ async fn intercept_in_mirror(
         .map(|a| a.iter().filter(|p| p.get("workspace_id").and_then(Value::as_str) == Some(ws_id)).collect())
         .unwrap_or_default();
 
-    // the junk: a bare placeholder pane the map doesn't know
+    // The junk is the object the event named, if it still qualifies — never
+    // "the first unmapped placeholder we can find". Scanning is what let a
+    // leftover pane become a target for an unrelated later event.
     let junk = all.iter().find(|p| {
         let pid = p.get("pane_id").and_then(Value::as_str).unwrap_or("");
-        !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder)
+        let named = if what == "tab" {
+            p.get("tab_id").and_then(Value::as_str) == Some(target)
+        } else {
+            pid == target
+        };
+        named && !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder)
     });
     let Some(junk) = junk else { return Ok(()) };
     let junk_id = junk.get("pane_id").and_then(Value::as_str).unwrap_or("").to_string();
     let junk_tab = junk.get("tab_id").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // Last gate before anything is closed: give the daemon time to claim it.
+    // An unmapped placeholder pane is ambiguous — it is equally the shape of a
+    // mirror pane the daemon created moments ago and has not mapped yet, and
+    // closing one of those is what reaches the REMOTE via close-through.
+    if settles_as_ours(env, api, config, &junk_id).await {
+        return Ok(());
+    }
 
     // a mirrored sibling to anchor the remote action's context on
     let sibling_in = |tab_only: bool| {
@@ -309,6 +432,13 @@ async fn junk_origin(
 
 /// Hand the remote-create machinery a context pointing at the mirror, exactly
 /// as if the matching plugin action had been invoked from that pane.
+/// Set when the caller is the intercept hook, so `remote_action::run` refuses
+/// its local fallback. That fallback exists so a bound key outside a mirror
+/// still does something useful; here it would recreate, inside a mirrored tab,
+/// the very local pane we just closed — and its own comment claims that never
+/// happens.
+pub const NO_LOCAL_FALLBACK_ENV: &str = "HERDR_MIRROR_NO_LOCAL_FALLBACK";
+
 async fn run_remote(
     env: &Env,
     ws_id: &str,
@@ -320,6 +450,7 @@ async fn run_remote(
     std::env::set_var("HERDR_ACTIVE_WORKSPACE_ID", ws_id);
     std::env::set_var("HERDR_ACTIVE_PANE_ID", pane_id);
     std::env::remove_var("HERDR_ACTIVE_PANE_CWD");
+    std::env::set_var(NO_LOCAL_FALLBACK_ENV, "1");
     let env2 = Env {
         config_search: env.config_search.clone(),
         state_dir: env.state_dir.clone(),
@@ -440,7 +571,18 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
 
 async fn create_local(env: &Env) -> Result<()> {
     let api = ApiClient::connect(&env.local_socket).await?;
-    let cwd = std::env::var(CWD_ENV).ok().filter(|s| !s.is_empty());
+    // An explicit cwd, always. `invoking_cwd` deliberately refuses to pass the
+    // `.mirror-pane` placeholder along, but sending no cwd is not the same as
+    // sending a safe one: herdr's default policy is Follow, so it re-derives the
+    // cwd from the focused pane — which, when the picker was summoned from a
+    // mirror, is that very placeholder. The workspace then looks exactly like
+    // the native junk the interception exists to close, so picking "this
+    // machine" from inside a mirror destroyed itself.
+    let cwd = std::env::var(CWD_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOME").ok())
+        .filter(|s| !s.is_empty());
     let res: Value = api.request("workspace.create", json!({ "cwd": cwd, "focus": true })).await?;
     println!(
         "created local workspace {}",
@@ -560,6 +702,9 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
 
 /// 1-based terminal row of the first option line — draw() emits two blank
 /// lines, the title, the rule, and one more blank line above the options.
+/// Screen row (1-based, as SGR mouse reports them) of the first option. `draw`
+/// positions each row absolutely from this, and the click handler subtracts it,
+/// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
 
 fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
@@ -571,6 +716,11 @@ fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
     let _ = write!(out, "\r\n\r\n    \x1b[1mNew workspace on...\x1b[0m\r\n");
     let _ = write!(out, "    \x1b[2m{}\x1b[0m\r\n\r\n", "─".repeat(rule_w));
     for (i, row) in rows.iter().enumerate() {
+        // Absolute, not "wherever the line feeds landed". The popup used to
+        // emit one line more than the pty had rows, so every draw scrolled by
+        // one while the click math still assumed the unscrolled layout: every
+        // mouse pick selected the row above the one clicked.
+        let _ = write!(out, "\x1b[{};1H", FIRST_ROW_Y + i);
         // "    ❯ 1 name   sub" — name column aligned so the subs line up; the
         // sub is dimmed and truncated to the popup width
         let sub_room = cols.saturating_sub(name_w + 14);

@@ -303,6 +303,17 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // mirrored we still go remote, never dropping a local object into a
     // daemon-owned workspace.
     if resolved.is_none() {
+        // The intercept hook opts out: it calls us from INSIDE a mirror
+        // workspace, having just closed a local object there, so degrading to a
+        // local create would put back exactly what it removed — and drop an
+        // unmirrored pane into a daemon-owned tab, which the comment above says
+        // never happens. Erroring is honest; `report_failure` surfaces it.
+        if std::env::var(crate::pick::NO_LOCAL_FALLBACK_ENV).is_ok() {
+            return Err(err(
+                "could not resolve the mirror host for this workspace; refusing to create a local object inside it"
+                    .to_string(),
+            ));
+        }
         match kind {
             "tab" => return local_tab(env, &ctx).await,
             // direction was validated at the top of this fn

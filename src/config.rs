@@ -129,10 +129,15 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
-    /// when true (the default), a native workspace create that lands in the
-    /// `.mirror-pane` placeholder (the sidebar's unrebindable "+" clicked from
-    /// inside a mirror) is closed and replaced by the host picker popup. Set
-    /// false to leave native creation entirely alone.
+    /// when true, a native create that lands in the `.mirror-pane` placeholder
+    /// (the sidebar's unrebindable "+" clicked from inside a mirror, or the
+    /// default new-tab/split keys) is closed and remade on the mirrored host:
+    /// a workspace gets the picker, a tab or split is recreated remotely.
+    ///
+    /// Defaults to FALSE, deliberately. Its verb is "close something the user
+    /// just created", and it can only ever react after the fact — herdr offers
+    /// no pre-create hook — so the honest default is that the plugin does not
+    /// silently change what a native control does until asked.
     pub intercept_native_create: bool,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
@@ -354,7 +359,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
-        intercept_native_create: raw.intercept_native_create.unwrap_or(true),
+        intercept_native_create: raw.intercept_native_create.unwrap_or(false),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -383,10 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn intercept_native_create_defaults_on_and_can_be_disabled() {
+    fn intercept_native_create_defaults_off_and_can_be_enabled() {
         let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
-        assert!(c.intercept_native_create); // default on
-        let c = parse_config("intercept_native_create = false\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(!c.intercept_native_create, "must not change native controls unasked");
+        let c = parse_config("intercept_native_create = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.intercept_native_create);
+        // a typo leaves it OFF rather than silently arming a destructive path
+        let c = parse_config("intercept_native_creat = true\n[hosts.a]\ntarget = \"a\"\n").unwrap();
         assert!(!c.intercept_native_create);
     }
 
