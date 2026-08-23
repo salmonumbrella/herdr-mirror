@@ -458,6 +458,9 @@ pub(crate) fn cmd_for_pane(
     let ctl_path = crate::remote::control_path(state_dir, &host.name)
         .display()
         .to_string();
+    let client_socket = crate::remote::client_relay_path(state_dir, &host.name)
+        .display()
+        .to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -488,10 +491,14 @@ pub(crate) fn cmd_for_pane(
         // foreground polls. Docker has no ControlMaster, and healing no longer
         // needs a host-identity token in the argv at all — it asks herdr what
         // is running in each pane instead (see daemon::has_live_streamer).
+        if matches!(kind, crate::config::HostKind::Ssh) {
+            argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+        }
+        // Terminal sessions use Herdr's separate client-protocol socket. The
+        // daemon owns this stable local relay for both SSH API transports and
+        // Docker; the pane passes it explicitly to Herdr.
+        argv.extend(["--client-socket".into(), client_socket.clone()]);
         match &kind {
-            crate::config::HostKind::Ssh => {
-                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
-            }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
@@ -500,6 +507,7 @@ pub(crate) fn cmd_for_pane(
                 argv.extend(["--container-folder".into(), folder.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
             }
+            crate::config::HostKind::Ssh => {}
         }
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
@@ -1767,11 +1775,8 @@ mod tests {
     /// Characterization test: the ssh pane argv is a cross-process contract.
     ///
     /// The daemon spawns `herdr-mirror pane ...` as a separate process, and
-    /// `count_streamers` (daemon.rs) identifies a host's live streamers by
-    /// string-matching `--ctl-path` in that argv. Nothing else pins the shape,
-    /// so a change here silently breaks mirror healing on upgrade: streamers
-    /// started by the old binary carry the old argv, the new daemon fails to
-    /// match them, concludes they died, and re-execs over live panes.
+    /// The daemon spawns this argv in another process, so options added here
+    /// must remain parseable by `pane::parse_args` and be pinned explicitly.
     ///
     /// If this test fails, that is the question to answer — not a prompt to
     /// update the expected value.
@@ -1790,6 +1795,8 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--client-socket",
+                "/state/vps-api-client.sock",
             ]
         );
         // argv[0] is the resolved exe path, which varies by install
@@ -1815,6 +1822,8 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--client-socket",
+                "/state/vps-api-client.sock",
             ]
         );
     }
@@ -1836,10 +1845,16 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--client-socket",
+                "/state/vps-api-client.sock",
             ]
         );
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.session.as_deref(), Some("work"));
+        assert_eq!(
+            parsed.client_socket.as_deref(),
+            Some(std::path::Path::new("/state/vps-api-client.sock"))
+        );
     }
 
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
@@ -1860,6 +1875,8 @@ mod tests {
                 "/Users/n/proj",
                 "w1:p1",
                 "--always-control",
+                "--client-socket",
+                "/state/token-api-client.sock",
                 // no identity token at all: healing asks herdr per pane
                 "--container-folder",
                 "/Users/n/proj",
@@ -1886,6 +1903,10 @@ mod tests {
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
         assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
+        assert_eq!(
+            parsed.client_socket.as_deref(),
+            Some(std::path::Path::new("/state/vps-api-client.sock"))
+        );
         let ct = parsed.container.expect("container must survive the argv round trip");
         assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));
         assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
@@ -1901,7 +1922,15 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--ctl-path",
+                "/state/vps.ctl",
+                "--client-socket",
+                "/state/vps-api-client.sock",
+            ]
         );
     }
 

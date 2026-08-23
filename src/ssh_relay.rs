@@ -158,7 +158,7 @@ struct ExecTarget {
 
 impl ExecTarget {
     fn relay_child(&self) -> Result<tokio::process::Child> {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(crate::remote::ssh_bin());
         cmd.args([
             "-S",
             &self.ctl_path.display().to_string(),

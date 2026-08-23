@@ -1,9 +1,10 @@
-// ssh transport for the DAEMON's own traffic (remote CLI execs + API-socket
-// forward) over one ControlMaster per host. Pane streams deliberately use
-// their own direct connections instead (see pane.rs).
+// SSH transport for the daemon's control traffic over one ControlMaster per
+// host. The JSON API uses streamlocal or an exec relay; the separate Herdr
+// terminal protocol always uses an exec relay that pane.rs consumes locally.
 
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -47,8 +48,19 @@ struct SshOutput {
     err: String,
 }
 
+pub(crate) fn ssh_bin() -> std::ffi::OsString {
+    #[cfg(test)]
+    {
+        std::env::var_os("HERDR_MIRROR_TEST_SSH_BIN").unwrap_or_else(|| "ssh".into())
+    }
+    #[cfg(not(test))]
+    {
+        "ssh".into()
+    }
+}
+
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
-    let fut = Command::new("ssh")
+    let fut = Command::new(ssh_bin())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -94,16 +106,21 @@ pub struct RemoteHost {
     pub cfg: HostConfig,
     ctl_path: PathBuf,
     pub fwd_sock: PathBuf,
+    client_sock: PathBuf,
     forwarded: bool,
     /// docker hosts only: resolved container + chosen stdio bridge
     container: Option<crate::docker::Container>,
     /// docker hosts only: owns the relay listener. Dropping it stops serving
     /// and unlinks the socket, so a reconnect never inherits a dead one.
     relay: Option<crate::docker::RelayHandle>,
+    /// docker hosts only: companion relay for Herdr's terminal protocol.
+    client_relay: Option<crate::docker::RelayHandle>,
     /// ssh hosts only: owns the exec-relay listener when the exec transport
     /// is in use. Same lifecycle reasoning as `relay` above, one level up
     /// the transport stack (ssh exec instead of `docker exec`).
     exec_relay: Option<crate::ssh_relay::RelayHandle>,
+    /// ssh hosts only: companion exec relay for Herdr's terminal protocol.
+    ssh_client_relay: Option<crate::ssh_relay::RelayHandle>,
     /// ssh hosts only: where the exec relay listens. Deliberately NOT
     /// `fwd_sock`: sharing one path with the streamlocal forward makes the
     /// relay's "is a healthy relay already serving this?" check answerable by
@@ -144,7 +161,7 @@ fn short_hash(s: &str) -> String {
     format!("{:08x}", hasher.finish() as u32)
 }
 
-/// Filename stem shared by a host's three sockets, bounded so the longest one
+/// Filename stem shared by a host's sockets, bounded so the longest one
 /// still fits sockaddr_un.
 ///
 /// Truncation alone is not enough: two hosts sharing a long prefix (exactly the
@@ -164,9 +181,9 @@ fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
 
     // macOS reserves one byte of sockaddr_un's 104-byte path for NUL; Linux
     // allows 108, and we deliberately apply the tighter bound on both so a
-    // hosts.toml is portable. Overhead is the worst case across the three
-    // suffixes (`-api-exec.sock`, 14) plus OpenSSH's mux temp suffix on the
-    // ControlPath (a dot and 11 chars); 21 keeps a little slack.
+    // hosts.toml is portable. The existing 21-byte overhead covers the longest
+    // relay suffix (`-api-client.sock`) and leaves room for OpenSSH's mux temp
+    // suffix on the shorter ControlPath.
     const MAX_SOCKET_PATH_BYTES: usize = 103;
     const CONTROL_SOCKET_OVERHEAD: usize = 21;
 
@@ -194,23 +211,54 @@ fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
     format!("{prefix}-{hash}")
 }
 
+/// Match Herdr's API → terminal-client socket derivation exactly: remove one
+/// trailing `.sock` when present, then append `-client.sock`. Work bytewise so
+/// a non-UTF-8 Unix path stays lossless.
+pub(crate) fn client_socket_path(api_socket: &Path) -> PathBuf {
+    let raw = api_socket.as_os_str().as_bytes();
+    let stem = raw.strip_suffix(b".sock").unwrap_or(raw);
+    let mut client = stem.to_vec();
+    client.extend_from_slice(b"-client.sock");
+    PathBuf::from(std::ffi::OsString::from_vec(client))
+}
+
+pub(crate) async fn socket_accepts(path: &Path) -> bool {
+    matches!(
+        timeout(
+            Duration::from_millis(500),
+            tokio::net::UnixStream::connect(path)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
     state_dir.join(format!("{}.ctl", socket_stem(state_dir, host_name)))
+}
+
+pub(crate) fn client_relay_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
+    state_dir.join(format!("{}-api-client.sock", socket_stem(state_dir, host_name)))
 }
 
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
         let stem = socket_stem(state_dir, &cfg.name);
+        let fwd_sock = state_dir.join(format!("{stem}-api.sock"));
+        let exec_sock = state_dir.join(format!("{stem}-api-exec.sock"));
         RemoteHost {
             ctl_path: state_dir.join(format!("{stem}.ctl")),
-            fwd_sock: state_dir.join(format!("{stem}-api.sock")),
+            client_sock: client_socket_path(&fwd_sock),
+            fwd_sock,
             transport_hint: cfg.api_transport,
             cfg: cfg.clone(),
             forwarded: false,
             container: None,
             relay: None,
+            client_relay: None,
             exec_relay: None,
-            exec_sock: state_dir.join(format!("{stem}-api-exec.sock")),
+            ssh_client_relay: None,
+            exec_sock,
             last_api_transport: None,
             log: Logger::new(state_dir, false),
         }
@@ -265,6 +313,18 @@ impl RemoteHost {
             "-o".into(),
             "BatchMode=yes".into(),
         ]
+    }
+
+    fn forward_command(&self, operation: &str, remote_socket: &str) -> Vec<String> {
+        let mut args = self.base_args();
+        args.extend([
+            "-O".into(),
+            operation.into(),
+            "-L".into(),
+            format!("{}:{remote_socket}", self.fwd_sock.display()),
+            self.cfg.target.clone(),
+        ]);
+        args
     }
 
     pub async fn ensure_master(&mut self) -> Result<()> {
@@ -384,23 +444,23 @@ impl RemoteHost {
         if self.forwarded && self.fwd_sock.exists() {
             return Ok(self.fwd_sock.clone());
         }
-        // NEVER cancel a healthy forward — other processes may be using it
+        // NEVER cancel a healthy forward — other processes may be using it.
         if self.fwd_sock.exists() && ApiClient::connect(&self.fwd_sock).await.is_ok() {
             self.forwarded = true;
             return Ok(self.fwd_sock.clone());
         }
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        // a dead process can leave the forward registered on the master with
-        // its socket file unlinked — cancel before re-adding
-        let mut cancel = self.base_args();
-        cancel.extend(["-O".into(), "cancel".into(), "-L".into(), spec.clone(), self.cfg.target.clone()]);
+        // A dead process can leave the forward registered on the master with
+        // its socket file unlinked — cancel before re-adding.
+        let cancel = self.forward_command("cancel", remote_socket);
         let _ = ssh(&cancel, 15000).await;
         let _ = std::fs::remove_file(&self.fwd_sock);
-        let mut fwd = self.base_args();
-        fwd.extend(["-O".into(), "forward".into(), "-L".into(), spec, self.cfg.target.clone()]);
-        let res = ssh(&fwd, 15000).await;
+        let forward = self.forward_command("forward", remote_socket);
+        let res = ssh(&forward, 15000).await;
         if res.code != 0 {
-            return Err(err(format!("ssh socket forward failed: {}", nonempty(&res.err, res.code))));
+            return Err(err(format!(
+                "ssh socket forward failed: {}",
+                nonempty(&res.err, res.code)
+            )));
         }
         self.forwarded = true;
         Ok(self.fwd_sock.clone())
@@ -430,9 +490,7 @@ impl RemoteHost {
     /// socket file unlinked. Unlike `forward_api`'s guard this cannot steal a
     /// healthy forward: it only runs after a real ping failed.
     async fn cancel_forward(&mut self, remote_socket: &str) {
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        let mut args = self.base_args();
-        args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
+        let args = self.forward_command("cancel", remote_socket);
         let _ = ssh(&args, 15000).await;
         let _ = std::fs::remove_file(&self.fwd_sock);
         self.forwarded = false;
@@ -442,7 +500,7 @@ impl RemoteHost {
     /// streamlocal forward. See `ssh_relay` for the transport itself; this
     /// only resolves the relay command once and (re)starts the listener,
     /// mirroring the docker branch below one function down.
-    async fn exec_relay_transport(&mut self, remote_socket: &str) -> Result<PathBuf> {
+    pub(crate) async fn exec_relay_transport(&mut self, remote_socket: &str) -> Result<PathBuf> {
         // NEVER steal a healthy relay — same reasoning as the docker guard:
         // the socket path is per-host but shared across processes (daemon,
         // `remote-*` actions, `once`), and state_dir is a single fixed path.
@@ -470,6 +528,68 @@ impl RemoteHost {
         Ok(path)
     }
 
+    pub(crate) async fn client_relay_transport(
+        &mut self,
+        remote_socket: &str,
+    ) -> Result<PathBuf> {
+        if self.ssh_client_relay.as_ref().is_some_and(|relay| relay.path.exists()) {
+            return Ok(self.client_sock.clone());
+        }
+        // A second daemon or a one-shot command may own the stable path. Do
+        // not unlink a listener that is accepting connections for live panes.
+        if self.ssh_client_relay.is_none() && socket_accepts(&self.client_sock).await {
+            return Ok(self.client_sock.clone());
+        }
+        self.ssh_client_relay = None;
+        let remote_client = client_socket_path(Path::new(remote_socket));
+        let remote_client = remote_client
+            .to_str()
+            .ok_or_else(|| err("remote Herdr client socket is not valid UTF-8"))?;
+        let relay_cmd = crate::ssh_relay::detect_relay_command(self, remote_client).await?;
+        self.log.log(&format!(
+            "[{}] terminal client relay via {} → {remote_client}",
+            self.cfg.name,
+            relay_cmd.tool()
+        ));
+        let handle = crate::ssh_relay::serve_relay(
+            self.ctl_path.clone(),
+            self.cfg.target.clone(),
+            relay_cmd,
+            self.client_sock.clone(),
+            self.log.clone(),
+        )?;
+        let path = handle.path.clone();
+        self.ssh_client_relay = Some(handle);
+        Ok(path)
+    }
+
+    async fn ensure_docker_client_relay(
+        &mut self,
+        container: &crate::docker::Container,
+        remote_socket: &str,
+    ) -> Result<PathBuf> {
+        if self.client_relay.as_ref().is_some_and(|relay| relay.path.exists()) {
+            return Ok(self.client_sock.clone());
+        }
+        if self.client_relay.is_none() && socket_accepts(&self.client_sock).await {
+            return Ok(self.client_sock.clone());
+        }
+        self.client_relay = None;
+        let remote_client = client_socket_path(Path::new(remote_socket));
+        let remote_client = remote_client
+            .to_str()
+            .ok_or_else(|| err("remote Herdr client socket is not valid UTF-8"))?;
+        let handle = crate::docker::serve_relay(
+            container.clone(),
+            remote_client.to_string(),
+            self.client_sock.clone(),
+            self.log.clone(),
+        )?;
+        let path = handle.path.clone();
+        self.client_relay = Some(handle);
+        Ok(path)
+    }
+
     /// Choose and reach the ssh API transport: streamlocal socket forward, or
     /// an exec relay. `api_transport = "socket"` / `"exec"` pin one and never
     /// try the other; the default `"auto"` tries the socket transport first
@@ -489,6 +609,12 @@ impl RemoteHost {
         if start_with_socket {
             match self.try_socket_transport(remote_socket).await {
                 Ok(api) => {
+                    if let Err(e) = self.client_relay_transport(remote_socket).await {
+                        self.log.log(&format!(
+                            "[{}] terminal client relay unavailable ({e}) — panes will use direct ssh",
+                            self.cfg.name
+                        ));
+                    }
                     self.last_api_transport = Some(ApiTransport::Socket);
                     return Ok(api);
                 }
@@ -509,6 +635,12 @@ impl RemoteHost {
 
         let sock = self.exec_relay_transport(remote_socket).await?;
         let api = ApiClient::connect(&sock).await?;
+        if let Err(e) = self.client_relay_transport(remote_socket).await {
+            self.log.log(&format!(
+                "[{}] terminal client relay unavailable ({e}) — panes will use direct ssh",
+                self.cfg.name
+            ));
+        }
         self.last_api_transport = Some(ApiTransport::Exec);
         Ok(api)
     }
@@ -556,6 +688,15 @@ impl RemoteHost {
             }
         };
         let api = ApiClient::connect(&sock).await?;
+        if let Err(e) = self
+            .ensure_docker_client_relay(container.as_ref().unwrap(), &status.socket)
+            .await
+        {
+            self.log.log(&format!(
+                "[{}] terminal client relay unavailable ({e}) — panes will use direct docker",
+                self.cfg.name
+            ));
+        }
         Ok((api, status))
     }
 
@@ -618,6 +759,110 @@ mod tests {
     }
 
     #[test]
+    fn herdr_client_socket_path_matches_the_real_cli() {
+        assert_eq!(
+            client_socket_path(Path::new("/tmp/host-api.sock")),
+            PathBuf::from("/tmp/host-api-client.sock")
+        );
+        assert_eq!(
+            client_socket_path(Path::new("/tmp/host-api-exec.sock")),
+            PathBuf::from("/tmp/host-api-exec-client.sock")
+        );
+        assert_eq!(
+            client_socket_path(Path::new("/tmp/custom")),
+            PathBuf::from("/tmp/custom-client.sock")
+        );
+    }
+
+    #[test]
+    fn streamlocal_forward_carries_only_the_api_socket() {
+        let state_dir = PathBuf::from("/tmp/herdr-mirror");
+        let remote = RemoteHost::new(&ssh_host("work"), &state_dir);
+
+        assert_eq!(
+            remote.forward_command("forward", "/run/user/501/herdr.sock"),
+            vec![
+                "-S",
+                "/tmp/herdr-mirror/work.ctl",
+                "-o",
+                "BatchMode=yes",
+                "-O",
+                "forward",
+                "-L",
+                "/tmp/herdr-mirror/work-api.sock:/run/user/501/herdr.sock",
+                "work.example.com",
+            ]
+        );
+        assert_eq!(
+            client_relay_path(&state_dir, "work"),
+            PathBuf::from("/tmp/herdr-mirror/work-api-client.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_accept_probe_distinguishes_live_and_missing_listeners() {
+        let path = test_path("socket-accepts");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        assert!(socket_accepts(&path).await);
+        drop(listener);
+        let _ = fs::remove_file(&path);
+        assert!(!socket_accepts(&path).await);
+    }
+
+    #[tokio::test]
+    async fn docker_client_relay_replaces_stale_socket_and_pumps_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = test_path("docker-client-relay");
+        fs::create_dir_all(&dir).unwrap();
+        let remote_api = dir.join("remote.sock");
+        let remote_client = client_socket_path(&remote_api);
+        let listener = tokio::net::UnixListener::bind(&remote_client).unwrap();
+        let endpoint = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let docker = dir.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\nremote=${6#UNIX-CONNECT:}\nexec python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(sys.stdin.buffer.read(4));sys.stdout.buffer.write(s.recv(4));sys.stdout.buffer.flush()' \"$remote\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let container = crate::docker::Container {
+            id: "test".into(),
+            docker_bin: docker.display().to_string(),
+        };
+        let mut cfg = ssh_host("docker");
+        cfg.kind = crate::config::HostKind::DockerContainer("test".into());
+        let mut remote = RemoteHost::new(&cfg, &dir);
+        fs::write(&remote.client_sock, b"stale").unwrap();
+
+        let local = remote
+            .ensure_docker_client_relay(&container, remote_api.to_str().unwrap())
+            .await
+            .unwrap();
+        let mode = fs::metadata(&local).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let mut client = tokio::net::UnixStream::connect(&local).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        endpoint.await.unwrap();
+
+        drop(remote);
+        assert!(!local.exists(), "relay owner must unlink its socket on drop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn long_host_names_use_truncated_socket_paths() {
         let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
         let name = "remote-development-environment-with-a-very-long-name";
@@ -633,6 +878,7 @@ mod tests {
         // the ControlPath must survive OpenSSH's mux temp suffix on top
         assert!(remote.ctl_path.as_os_str().len() + 17 <= 103);
         assert!(remote.fwd_sock.as_os_str().len() <= 103);
+        assert!(remote.client_sock.as_os_str().len() <= 103);
         assert!(remote.exec_sock.as_os_str().len() <= 103);
     }
 

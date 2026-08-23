@@ -19,9 +19,11 @@
 //   --max-rows N        uncapped — control fills the local pane). Set for a
 //                       remote with its own display: the remote keeps its own
 //                       geometry and the rest of the local pane stays blank.
+//   --client-socket PATH daemon-owned relay to the remote Herdr terminal socket
 //
-// Every stream gets its own direct ssh connection (no shared ControlMaster):
-// isolated, and nothing persists to go stale on a flaky network.
+// Streams prefer the daemon-owned local relay to Herdr's terminal-protocol
+// socket. A missing or failed relay falls back once to the original direct
+// ssh/docker process, so stale daemon state cannot strand a pane blank.
 //
 // One owner of all state, message-driven: frames, keystrokes, timers, and
 // ssh-child exits arrive on one channel; a session generation number tags
@@ -75,6 +77,8 @@ pub struct Args {
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
     pub ctl_path: Option<String>,
+    /// daemon-owned local relay to the remote Herdr terminal client socket.
+    pub client_socket: Option<std::path::PathBuf>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
 }
@@ -102,6 +106,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         max_cols: None,
         max_rows: None,
         ctl_path: None,
+        client_socket: None,
         container: None,
     };
     let mut container_name: Option<String> = None;
@@ -140,6 +145,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     .filter(|&n| n > 0)
             }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
+            "--client-socket" => {
+                args.client_socket = Some(std::path::PathBuf::from(next("--client-socket")?))
+            }
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
@@ -200,7 +208,14 @@ struct Frame {
 
 enum Msg {
     Frame { gen: u64, frame: Frame },
-    SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
+    SessionExit {
+        gen: u64,
+        mode: Mode,
+        transport: Transport,
+        saw_frame: bool,
+        reason: String,
+        uptime: Duration,
+    },
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
@@ -208,6 +223,51 @@ enum Msg {
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Transport {
+    Relayed,
+    DirectSsh,
+    Container,
+}
+
+fn fallback_to_direct(transport: Transport, saw_frame: bool) -> bool {
+    transport == Transport::Relayed && !saw_frame
+}
+
+#[derive(Default)]
+struct RelayFallback {
+    bypass_once: bool,
+}
+
+impl RelayFallback {
+    fn allow_relay(&mut self) -> bool {
+        !std::mem::take(&mut self.bypass_once)
+    }
+
+    fn note_failure(&mut self, transport: Transport, saw_frame: bool) {
+        if fallback_to_direct(transport, saw_frame) {
+            self.bypass_once = true;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpawnFailure {
+    transport: Transport,
+    reason: String,
+}
+
+impl SpawnFailure {
+    fn new(transport: Transport, error: impl std::fmt::Display) -> Self {
+        Self { transport, reason: error.to_string() }
+    }
+}
+
+#[cfg(not(test))]
+const FIRST_RELAY_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const FIRST_RELAY_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Session {
     gen: u64,
@@ -221,7 +281,54 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+fn forwarded_api_candidates(ctl_path: &str) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(ctl_path);
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Some(stem) = name.strip_suffix(".ctl") else {
+        return Vec::new();
+    };
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    vec![
+        dir.join(format!("{stem}-api.sock")),
+        dir.join(format!("{stem}-api-exec.sock")),
+    ]
+}
+
+async fn relayed_client_socket(args: &Args) -> Option<std::path::PathBuf> {
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let client_socket = args.client_socket.as_ref()?;
+    if !crate::remote::socket_accepts(client_socket).await {
+        return None;
+    }
+    // Docker has no separate local API signal; reaching the client listener is
+    // enough to try it, and a failed Herdr handshake falls back to docker exec.
+    if args.container.is_some() {
+        return Some(client_socket.clone());
+    }
+    let ctl_path = args.ctl_path.as_deref()?;
+    for socket in forwarded_api_candidates(ctl_path) {
+        if matches!(
+            tokio::time::timeout(PROBE_TIMEOUT, crate::api::ApiClient::connect(&socket)).await,
+            Ok(Ok(_))
+        ) {
+            return Some(client_socket.clone());
+        }
+    }
+    None
+}
+
+async fn spawn_session(
+    args: &Args,
+    mode: Mode,
+    cols: usize,
+    rows: usize,
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+    allow_relay: bool,
+) -> std::result::Result<Session, SpawnFailure> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -237,15 +344,41 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         cols,
         rows
     );
-    // ssh and docker differ only in how the command is carried; the streaming
-    // contract (piped stdio, herdr's frames on stdout) is identical
-    let mut builder = match &args.container {
-        None => {
-            let mut c = tokio::process::Command::new("ssh");
-            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(cmd);
-            c
+    let relayed = if allow_relay {
+        relayed_client_socket(args).await
+    } else {
+        None
+    };
+    // ssh, the daemon's forwarded socket, and docker differ only in how the
+    // command is carried; the streaming contract is identical.
+    let (mut builder, transport) = match (&args.container, relayed) {
+        // The daemon already owns a relay to the remote Herdr terminal socket.
+        // Prefer it for the long-lived stream: besides avoiding one transport
+        // child per pane, this works when a supervised macOS pane cannot
+        // resolve its own uid during OpenSSH startup (#60). Standalone `pane`
+        // invocations have no relay and retain the direct fallback below.
+        (_, Some(client_socket)) => {
+            let bin = std::env::var_os("HERDR_BIN_PATH")
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "herdr".into());
+            let mut c = tokio::process::Command::new(bin);
+            c.args(["terminal", "session", mode.as_str()])
+                .arg(&args.pane_target)
+                .arg("--cols")
+                .arg(cols.to_string())
+                .arg("--rows")
+                .arg(rows.to_string())
+                .env_remove("HERDR_SOCKET_PATH")
+                .env("HERDR_CLIENT_SOCKET_PATH", client_socket)
+                .env_remove("HERDR_SESSION");
+            (c, Transport::Relayed)
         }
-        Some(ct) => {
+        (None, None) => {
+            let mut c = tokio::process::Command::new(crate::remote::ssh_bin());
+            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(cmd);
+            (c, Transport::DirectSsh)
+        }
+        (Some(ct), _) => {
             // resolve per spawn so a rebuilt container is picked up on
             // reconnect. Bounded: this runs on the pane's single-threaded
             // runtime, so a wedged Docker daemon must not be able to freeze
@@ -254,22 +387,33 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
                 &ct.docker_bin,
                 &ct.kind,
                 Duration::from_secs(5),
-            )?;
+            )
+            .map_err(|e| SpawnFailure::new(Transport::Container, e))?;
             let mut c = tokio::process::Command::new(&ct.docker_bin);
             // `sh -c` not `-lc`: match ssh's non-login remote shell
             c.args(["exec", "-i", &id, "sh", "-c", &cmd]);
-            c
+            (c, Transport::Container)
         }
     };
     let mut child = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| SpawnFailure::new(transport, e))?;
     let pid = child.id().map(|p| p as i32).unwrap_or(0);
-    let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
-    let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SpawnFailure::new(transport, "no child stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SpawnFailure::new(transport, "no child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SpawnFailure::new(transport, "no child stderr"))?;
     let started = Instant::now();
 
     tokio::spawn(async move {
@@ -290,9 +434,27 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             }
         });
         let mut close_reason = String::new();
+        let mut saw_frame = false;
+        let first_frame_deadline = started + FIRST_RELAY_FRAME_TIMEOUT;
         let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            let next = if transport == Transport::Relayed && !saw_frame {
+                match tokio::time::timeout_at(first_frame_deadline, lines.next_line()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        close_reason = "terminal relay timed out before its first frame".into();
+                        let _ = child.start_kill();
+                        break;
+                    }
+                }
+            } else {
+                lines.next_line().await
+            };
+            let Ok(Some(line)) = next else { break };
             let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
+            if frame.kind == "terminal.frame" {
+                saw_frame = true;
+            }
             if frame.kind == "terminal.closed" {
                 if let Some(r) = &frame.reason {
                     close_reason = r.clone();
@@ -306,7 +468,16 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
         let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let _ = tx
+            .send(Msg::SessionExit {
+                gen,
+                mode,
+                transport,
+                saw_frame,
+                reason,
+                uptime: started.elapsed(),
+            })
+            .await;
     });
 
     Ok(Session { gen, mode, pid, stdin })
@@ -683,6 +854,10 @@ struct App {
     switch_at: Option<Instant>,
     session: Option<Session>,
     next_gen: u64,
+    /// A relayed Herdr process that exits before its first frame may have a
+    /// locally live but remotely broken client socket. Bypass it once so the
+    /// existing direct SSH/docker transport gets a chance to recover the pane.
+    relay_fallback: RelayFallback,
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
@@ -911,7 +1086,18 @@ impl App {
             unsafe { libc::kill(s.pid, libc::SIGTERM) };
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
+        let allow_relay = self.relay_fallback.allow_relay();
+        match spawn_session(
+            &self.args,
+            m,
+            cols,
+            rows,
+            self.next_gen,
+            self.tx.clone(),
+            allow_relay,
+        )
+        .await
+        {
             Ok(mut s) => {
                 if m == Mode::Control {
                     self.last_input = Instant::now();
@@ -935,7 +1121,10 @@ impl App {
                     },
                 );
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(failure) => {
+                self.relay_fallback.note_failure(failure.transport, false);
+                self.schedule_reconnect(m, &failure.reason);
+            }
         }
     }
 
@@ -1039,11 +1228,20 @@ impl App {
         }
     }
 
-    fn handle_exit(&mut self, gen: u64, exited_mode: Mode, reason: String, uptime: Duration) {
+    fn handle_exit(
+        &mut self,
+        gen: u64,
+        exited_mode: Mode,
+        transport: Transport,
+        saw_frame: bool,
+        reason: String,
+        uptime: Duration,
+    ) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
             return; // an old child we already replaced/killed
         }
         self.session = None;
+        self.relay_fallback.note_failure(transport, saw_frame);
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
         // control that dies quickly twice is failing (refused/dropped): fall
@@ -1471,6 +1669,7 @@ pub async fn run(args: Args) -> Result<()> {
         switch_at: None,
         session: None,
         next_gen: 0,
+        relay_fallback: RelayFallback::default(),
         backoff_idx: 0,
         reconnect_at: None,
         control_failures: 0,
@@ -1542,7 +1741,14 @@ pub async fn run(args: Args) -> Result<()> {
                 match msg {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
-                    Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::SessionExit {
+                        gen,
+                        mode,
+                        transport,
+                        saw_frame,
+                        reason,
+                        uptime,
+                    }) => app.handle_exit(gen, mode, transport, saw_frame, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
@@ -1642,6 +1848,69 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "herdr-mirror-{prefix}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PidGuard(i32);
+
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe { libc::kill(self.0, libc::SIGTERM) };
+            }
+        }
+    }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
     /// every existing headless-remote config silently changes behaviour.
@@ -1760,6 +2029,699 @@ mod tests {
         // overflow-proof mouse params: 11 digits saturate instead of panicking
         let (_, x, _, _, _) = parse_mouse(b"\x1b[<64;99999999999;1M", 0).unwrap();
         assert_eq!(x, u32::MAX);
+    }
+
+    #[test]
+    fn relayed_exit_without_a_frame_forces_one_direct_attempt() {
+        let mut fallback = RelayFallback::default();
+        assert!(fallback.allow_relay(), "first attempt should use the relay");
+        fallback.note_failure(Transport::Relayed, false);
+        assert!(!fallback.allow_relay(), "the next attempt must bypass it");
+        assert!(fallback.allow_relay(), "the bypass is exactly one attempt");
+        assert!(!fallback_to_direct(Transport::Relayed, true));
+        assert!(!fallback_to_direct(Transport::DirectSsh, false));
+        assert!(!fallback_to_direct(Transport::Container, false));
+    }
+
+    #[tokio::test]
+    async fn ssh_pane_streams_through_the_daemon_forward_without_launching_ssh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = ENV_LOCK.lock().await;
+        let temp = TempDirGuard::new("forwarded-pane");
+        let dir = temp.path();
+        let ctl = dir.join("work.ctl");
+        let api = dir.join("work-api.sock");
+        let client = crate::remote::client_socket_path(&api);
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let _client_listener = tokio::net::UnixListener::bind(&client).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let request = lines.next_line().await.unwrap().unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap();
+            write
+                .write_all(format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let fake_herdr = dir.join("herdr");
+        std::fs::write(
+            &fake_herdr,
+            format!(
+                "#!/bin/sh\n[ -z \"$HERDR_SOCKET_PATH\" ] || exit 90\n[ \"$HERDR_CLIENT_SOCKET_PATH\" = '{}' ] || exit 91\nprintf '%s\\n' '{{\"type\":\"terminal.frame\"}}'\n",
+                client.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _bin = EnvVarGuard::set("HERDR_BIN_PATH", &fake_herdr);
+        let args = Args {
+            ssh_target: "127.0.0.1".into(),
+            pane_target: "w1:p1".into(),
+            remote_bin: Some("/remote/herdr".into()),
+            cols: 120,
+            rows: 40,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(ctl.display().to_string()),
+            client_socket: Some(client.clone()),
+            container: None,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let session = spawn_session(&args, Mode::Observe, 120, 40, 1, tx, true)
+            .await
+            .unwrap();
+        let _session = PidGuard(session.pid);
+        let got_frame = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = rx.recv().await {
+                if matches!(msg, Msg::Frame { frame: Frame { ref kind, .. }, .. } if kind == "terminal.frame") {
+                    return true;
+                }
+                if matches!(msg, Msg::SessionExit { .. }) {
+                    return false;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert!(got_frame, "daemon-spawned panes must not need a fresh ssh client");
+    }
+
+    #[tokio::test]
+    async fn api_only_forward_is_not_selected_for_terminal_streaming() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = ENV_LOCK.lock().await;
+        let temp = TempDirGuard::new("api-only-forward");
+        let dir = temp.path();
+        let ctl = dir.join("work.ctl");
+        let api = dir.join("work-api.sock");
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let request = lines.next_line().await.unwrap().unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap();
+            write
+                .write_all(format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"terminal.frame\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ssh = EnvVarGuard::set("HERDR_MIRROR_TEST_SSH_BIN", &fake_ssh);
+        let args = Args {
+            ssh_target: "work".into(),
+            pane_target: "w1:p1".into(),
+            remote_bin: None,
+            cols: 80,
+            rows: 24,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(ctl.display().to_string()),
+            client_socket: Some(crate::remote::client_socket_path(&api)),
+            container: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let session = spawn_session(&args, Mode::Observe, 80, 24, 1, tx, true)
+            .await
+            .unwrap();
+        let _session = PidGuard(session.pid);
+        let got_direct_frame = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, .. },
+                        ..
+                    } if kind == "terminal.frame" => return true,
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert!(
+            got_direct_frame,
+            "an old daemon's API-only forward must launch the direct SSH transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn relayed_spawn_failure_is_followed_by_a_direct_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = ENV_LOCK.lock().await;
+        let temp = TempDirGuard::new("relay-spawn-failure");
+        let dir = temp.path();
+        let ctl = dir.join("work.ctl");
+        let api = dir.join("work-api.sock");
+        let client = crate::remote::client_socket_path(&api);
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let _client_listener = tokio::net::UnixListener::bind(&client).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let request: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id = request["id"].as_str().unwrap();
+            write
+                .write_all(
+                    format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"terminal.frame\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ssh = EnvVarGuard::set("HERDR_MIRROR_TEST_SSH_BIN", &fake_ssh);
+        let _bin = EnvVarGuard::set("HERDR_BIN_PATH", dir.join("missing-herdr"));
+        let args = Args {
+            ssh_target: "work".into(),
+            pane_target: "w1:p1".into(),
+            remote_bin: None,
+            cols: 80,
+            rows: 24,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(ctl.display().to_string()),
+            client_socket: Some(client),
+            container: None,
+        };
+        let mut fallback = RelayFallback::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let allow_relay = fallback.allow_relay();
+        let failure = match spawn_session(&args, Mode::Observe, 80, 24, 1, tx, allow_relay).await {
+            Ok(session) => {
+                let _session = PidGuard(session.pid);
+                panic!("missing local Herdr unexpectedly spawned")
+            }
+            Err(failure) => failure,
+        };
+        fallback.note_failure(failure.transport, false);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let allow_relay = fallback.allow_relay();
+        assert!(!allow_relay, "spawn failure must consume one direct attempt");
+        let direct = spawn_session(&args, Mode::Observe, 80, 24, 2, tx, allow_relay)
+            .await
+            .unwrap();
+        let _direct = PidGuard(direct.pid);
+        let got_frame = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, .. },
+                        ..
+                    } if kind == "terminal.frame" => return true,
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(got_frame, "relay spawn failure must fall back to direct SSH");
+        assert!(fallback.allow_relay(), "relay bypass must be one-shot");
+    }
+
+    #[tokio::test]
+    async fn relayed_first_frame_timeout_is_followed_by_a_direct_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = ENV_LOCK.lock().await;
+        let temp = TempDirGuard::new("relay-first-frame-timeout");
+        let dir = temp.path();
+        let ctl = dir.join("work.ctl");
+        let api = dir.join("work-api.sock");
+        let client = crate::remote::client_socket_path(&api);
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let _client_listener = tokio::net::UnixListener::bind(&client).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let request: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id = request["id"].as_str().unwrap();
+            write
+                .write_all(
+                    format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let fake_herdr = dir.join("herdr");
+        std::fs::write(&fake_herdr, "#!/bin/sh\nread ignored\n").unwrap();
+        std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"terminal.frame\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin = EnvVarGuard::set("HERDR_BIN_PATH", &fake_herdr);
+        let _ssh = EnvVarGuard::set("HERDR_MIRROR_TEST_SSH_BIN", &fake_ssh);
+        let args = Args {
+            ssh_target: "work".into(),
+            pane_target: "w1:p1".into(),
+            remote_bin: None,
+            cols: 80,
+            rows: 24,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(ctl.display().to_string()),
+            client_socket: Some(client),
+            container: None,
+        };
+        let mut fallback = RelayFallback::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        let allow_relay = fallback.allow_relay();
+        let relayed = spawn_session(&args, Mode::Observe, 80, 24, 1, tx, allow_relay)
+            .await
+            .unwrap();
+        let _relayed = PidGuard(relayed.pid);
+        let exit = tokio::time::timeout(Duration::from_secs(4), async {
+            while let Some(msg) = rx.recv().await {
+                if let Msg::SessionExit {
+                    transport,
+                    saw_frame,
+                    reason,
+                    ..
+                } = msg
+                {
+                    return (transport, saw_frame, reason);
+                }
+            }
+            panic!("relayed child ended without SessionExit")
+        })
+        .await
+        .expect("relayed first-frame deadline did not fire");
+        assert_eq!(exit.0, Transport::Relayed);
+        assert!(!exit.1);
+        assert!(exit.2.contains("timed out before its first frame"), "{}", exit.2);
+        fallback.note_failure(exit.0, exit.1);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let allow_relay = fallback.allow_relay();
+        assert!(!allow_relay, "timeout must consume one direct attempt");
+        let direct = spawn_session(&args, Mode::Observe, 80, 24, 2, tx, allow_relay)
+            .await
+            .unwrap();
+        let _direct = PidGuard(direct.pid);
+        let got_frame = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, .. },
+                        ..
+                    } if kind == "terminal.frame" => return true,
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(got_frame, "hung relay must fall back to direct SSH");
+        assert!(fallback.allow_relay(), "relay bypass must be one-shot");
+    }
+
+    /// The fast test above deliberately fakes the Herdr executable. This one
+    /// runs a real isolated Herdr server and terminal client through Mirror's
+    /// client relay. Its ssh program is a local transport surrogate: this
+    /// proves path derivation and the Herdr protocol, not a live ssh channel.
+    #[tokio::test]
+    #[ignore = "requires herdr 0.7.2+ on PATH"]
+    async fn client_relay_reaches_a_real_herdr_terminal_stream() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = ENV_LOCK.lock().await;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = TempDirGuard::new("real-stream");
+        let dir = temp.path();
+
+        let herdr_bin = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+        let real_api = dir.join("server.sock");
+        let real_client = crate::remote::client_socket_path(&real_api);
+        let xdg_config = dir.join("xdg-config");
+        let xdg_state = dir.join("xdg-state");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        std::fs::create_dir_all(&xdg_state).unwrap();
+        let session_name = format!("mirror-it-{}-{nonce}", std::process::id());
+
+        let mut server_cmd = tokio::process::Command::new(&herdr_bin);
+        server_cmd
+            .arg("server")
+            .current_dir(dir)
+            .env("HERDR_CONFIG_PATH", "/dev/null")
+            .env("HERDR_SOCKET_PATH", &real_api)
+            .env("HERDR_CLIENT_SOCKET_PATH", &real_client)
+            .env("HERDR_SESSION", &session_name)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut server = server_cmd.spawn().unwrap();
+
+        for _ in 0..100 {
+            if real_api.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            real_api.exists(),
+            "isolated Herdr server did not create its API socket"
+        );
+
+        let created = tokio::process::Command::new(&herdr_bin)
+            .args(["workspace", "create", "--cwd"])
+            .arg(dir)
+            .args(["--label", "mirror-it", "--no-focus"])
+            .env("HERDR_CONFIG_PATH", "/dev/null")
+            .env("HERDR_SOCKET_PATH", &real_api)
+            .env("HERDR_CLIENT_SOCKET_PATH", &real_client)
+            .env("HERDR_SESSION", &session_name)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .output()
+            .await
+            .unwrap();
+        assert!(created.status.success(), "workspace create failed");
+        let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+        let pane_id = created
+            .pointer("/result/root_pane/pane_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        for _ in 0..100 {
+            if real_client.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            real_client.exists(),
+            "isolated Herdr server did not create its client socket"
+        );
+
+        // The fake ControlMaster materializes the API streamlocal mapping and
+        // runs relay exec commands locally. The real client handshake still
+        // crosses Mirror's Unix listener and byte pump.
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nop=\nlast=\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -O) op=$2; shift 2 ;;\n    -L) spec=$2; local=${spec%%:*}; remote=${spec#*:}; shift 2\n        if [ \"$op\" = forward ]; then ln -sf \"$remote\" \"$local\"; else rm -f \"$local\"; fi ;;\n    *) last=$1; shift ;;\n  esac\ndone\n[ -n \"$op\" ] && exit 0\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _ssh = EnvVarGuard::set("HERDR_MIRROR_TEST_SSH_BIN", &fake_ssh);
+        let _bin = EnvVarGuard::set("HERDR_BIN_PATH", &herdr_bin);
+
+        let host = crate::config::HostConfig {
+            name: "work".into(),
+            target: "127.0.0.1".into(),
+            kind: crate::config::HostKind::Ssh,
+            docker_bin: "docker".into(),
+            prefix: "work".into(),
+            remote_bin: None,
+            session: None,
+            max_cols: None,
+            max_rows: None,
+            api_transport: crate::config::ApiTransport::Socket,
+            always_control: true,
+        };
+        let mut remote = crate::remote::RemoteHost::new(&host, dir);
+        let forwarded_api = remote
+            .forward_api(real_api.to_str().unwrap())
+            .await
+            .expect("API forward registration");
+        let expected_client = crate::remote::client_relay_path(dir, "work");
+        std::fs::write(&expected_client, b"stale").unwrap();
+        let client_relay = remote
+            .client_relay_transport(real_api.to_str().unwrap())
+            .await
+            .expect("terminal client relay registration");
+        assert!(forwarded_api.exists());
+        assert!(client_relay.exists());
+        assert_eq!(
+            std::fs::metadata(&client_relay)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let args = Args {
+            ssh_target: host.target,
+            pane_target: pane_id,
+            remote_bin: None,
+            cols: 80,
+            rows: 24,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(
+                crate::remote::control_path(dir, "work")
+                    .display()
+                    .to_string(),
+            ),
+            client_socket: Some(crate::remote::client_relay_path(dir, "work")),
+            container: None,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut stream = spawn_session(&args, Mode::Control, 80, 24, 1, tx, true)
+            .await
+            .unwrap();
+        let _stream = PidGuard(stream.pid);
+        let got_socket_frame = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, .. },
+                        ..
+                    } if kind == "terminal.frame" => {
+                        return true;
+                    }
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        let marker = "HERDR_MIRROR_RELAY_INPUT_OK";
+        let input = json!({
+            "type": "terminal.input",
+            "bytes": B64.encode(format!("printf '{marker}\\n'\n")),
+        })
+        .to_string()
+            + "\n";
+        stream.stdin.write_all(input.as_bytes()).await.unwrap();
+        let got_control_echo = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, bytes, .. },
+                        ..
+                    } if kind == "terminal.frame" => {
+                        if let Some(bytes) = bytes.and_then(|bytes| B64.decode(bytes).ok()) {
+                            output.push_str(&String::from_utf8_lossy(&bytes));
+                            if output.contains(marker) {
+                                return true;
+                            }
+                        }
+                    }
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+
+        drop(remote);
+        assert!(!client_relay.exists(), "dropping the host must unlink its client relay");
+        let _ = std::fs::remove_file(&forwarded_api);
+
+        let exec_host = crate::config::HostConfig {
+            name: "exec".into(),
+            target: "127.0.0.1".into(),
+            api_transport: crate::config::ApiTransport::Exec,
+            ..host
+        };
+        let mut exec_remote = crate::remote::RemoteHost::new(&exec_host, dir);
+        let exec_api = exec_remote
+            .exec_relay_transport(real_api.to_str().unwrap())
+            .await
+            .expect("API exec relay registration");
+        let exec_client = exec_remote
+            .client_relay_transport(real_api.to_str().unwrap())
+            .await
+            .expect("terminal client exec relay registration");
+        assert!(exec_api.exists());
+        assert!(exec_client.exists());
+        assert_eq!(
+            std::fs::metadata(&exec_client)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let exec_args = Args {
+            ssh_target: exec_host.target,
+            pane_target: args.pane_target,
+            ctl_path: Some(
+                crate::remote::control_path(dir, "exec")
+                    .display()
+                    .to_string(),
+            ),
+            client_socket: Some(crate::remote::client_relay_path(dir, "exec")),
+            ..args
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let exec_stream = spawn_session(&exec_args, Mode::Observe, 80, 24, 2, tx, true)
+            .await
+            .unwrap();
+        let _exec_stream = PidGuard(exec_stream.pid);
+        let got_exec_frame = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Msg::Frame {
+                        frame: Frame { kind, .. },
+                        ..
+                    } if kind == "terminal.frame" => return true,
+                    Msg::SessionExit { .. } => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+        drop(exec_remote);
+        assert!(!exec_client.exists(), "dropping the host must unlink its client relay");
+        assert!(
+            got_socket_frame,
+            "the real Herdr client must reach the client relay beside a socket API"
+        );
+        assert!(got_control_echo, "control input must round-trip through the client relay");
+        assert!(
+            got_exec_frame,
+            "the real Herdr client must reach the exec-relay client socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blackholed_forward_cannot_freeze_the_pane_reconnect_loop() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-blackholed-forward-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join("work.ctl");
+        let api = dir.join("work-api.sock");
+        let client = crate::remote::client_socket_path(&api);
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let _client_listener = tokio::net::UnixListener::bind(&client).unwrap();
+        let blackhole = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let args = Args {
+            ssh_target: "work".into(),
+            pane_target: "w1:p1".into(),
+            remote_bin: None,
+            cols: 120,
+            rows: 40,
+            dump: true,
+            session: None,
+            control_idle_secs: 3600,
+            always_control: false,
+            max_cols: None,
+            max_rows: None,
+            ctl_path: Some(ctl.display().to_string()),
+            client_socket: Some(client.clone()),
+            container: None,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(1500),
+            relayed_client_socket(&args),
+        )
+        .await;
+
+        blackhole.abort();
+        let _ = blackhole.await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result.unwrap(), None, "a dead forward must fall back promptly");
     }
 
     #[test]
