@@ -1423,7 +1423,17 @@ pub async fn run(args: Args) -> Result<()> {
         // drop otherwise arrives as bare text with no terminator at all. The
         // framing is stripped only to recognise a drop and put back on the way
         // out (`route_paste_body`), so the remote app still sees a paste.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+        // 1007 OFF (alternate scroll). It defaults to ON, and at a shell we
+        // release the grab so herdr can select natively — which leaves this
+        // pane as "alt screen, no mouse reporting, 1007 on", the one state
+        // where herdr's wheel routing types an Up/Down arrow per notch into the
+        // pane app. That app is us, so the arrows are forwarded to the remote
+        // and the shell walks its command history instead of scrolling (#69).
+        // Cleared, routing falls to host scroll, which on the alt screen has
+        // nothing to move: the wheel does nothing rather than the wrong thing.
+        // While the grab IS held this is never consulted — mouse reporting wins
+        // the routing — so nothing about the selection path changes.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
         RawMode::enable()
     } else {
         None
@@ -1618,7 +1628,10 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        // 1007 back on: it is a default-on mode we turned off, so leaving it
+        // clear would silently change the wheel for whatever runs in this pane
+        // after the streamer exits
+        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
