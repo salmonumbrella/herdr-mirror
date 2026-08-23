@@ -90,11 +90,13 @@ command = ["./target/release/herdr-mirror", "teardown"]
 on = "workspace.focused"
 command = ["./target/release/herdr-mirror", "ensure"]
 
-# The mouse path to the picker: herdr can't rebind the sidebar's buttons, but
-# a native create from inside a mirror lands in the .mirror-pane placeholder —
-# these hooks recognize the botched object, close it, and do what the user
-# meant: workspaces get the host picker; tabs and splits are recreated on the
-# remote. No-op for every other creation. See src/pick.rs::intercept.
+# The mouse path to the picker: herdr can't rebind the sidebar's buttons, and a
+# native create from inside a mirror lands in the .mirror-pane placeholder, so
+# these hooks catch that object and do what the user meant: a workspace gets the
+# host picker, a tab or split is recreated on the remote. Each hook acts only on
+# the object its own event names, only inside a live mirror workspace, and only
+# after the daemon has had a chance to claim it. Everything else is a no-op.
+# See src/pick.rs::intercept.
 [[events]]
 on = "workspace.created"
 command = ["./target/release/herdr-mirror", "intercept-new", "workspace"]

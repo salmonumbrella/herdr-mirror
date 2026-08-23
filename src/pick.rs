@@ -189,14 +189,13 @@ fn event_object_id(what: &str) -> Option<String> {
 }
 
 pub async fn intercept(env: Env, what: &str) -> Result<()> {
-    // Fail CLOSED. This is the opt-out for a feature whose verb is "close
-    // something the user just created", so an unreadable hosts.toml must not
-    // silently re-arm it — which is what returning early on `.ok()` used to do,
-    // since the workspace arm needs no config and ran anyway.
+    // No config gate. Every guard below is a positive test for an object that
+    // is junk by construction — created inside a live mirror workspace, sitting
+    // in the `.mirror-pane` placeholder, unmapped, and named by this very
+    // event — so there is nothing here a user would want to opt out of that
+    // they would not rather have fixed. An unreadable config still stops us,
+    // because without hosts we cannot tell a mirror workspace from any other.
     let Ok(config) = load_config(&env.config_search) else { return Ok(()) };
-    if !config.intercept_native_create {
-        return Ok(());
-    }
     // Nothing to recreate the object on if the daemon cannot act: with it
     // stopped or paused we would close the local tab, create a real one on the
     // remote, and no mirror would ever come back — the failure being silent
