@@ -781,9 +781,15 @@ impl App {
     }
 
     fn hint(&mut self, text: &str) {
+        self.hint_for(text, Duration::from_millis(1500));
+    }
+
+    /// A hint that stays up longer than the usual flash, for one the user did
+    /// not cause by typing and so is not already watching for.
+    fn hint_for(&mut self, text: &str, ttl: Duration) {
         self.renderer.status(text);
         self.paint();
-        self.hint_clear_at = Some(Instant::now() + Duration::from_millis(1500));
+        self.hint_clear_at = Some(Instant::now() + ttl);
     }
 
     /// A hint with no expiry, for work whose duration we don't know: an upload
@@ -1415,6 +1421,25 @@ pub async fn run(args: Args) -> Result<()> {
     });
 
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+
+    // Say which local pane we are drawing, so anything holding only a herdr
+    // pane id can find us. herdr hands every event hook the id of the pane it
+    // is talking about and no way to write to it; this is how a hook reaches
+    // the streamer sitting in that pane. HERDR_PANE_ID comes from herdr itself
+    // and is inherited by whatever it starts in a pane, which is us.
+    let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
+    let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
+    let _pane_pidfile = local_pane_id.as_deref().map(|id| {
+        let path = crate::util::pane_pid_path(&state_dir, id);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, std::process::id().to_string());
+        // drop anything addressed to this pane before we existed: it describes
+        // something that happened to a previous occupant
+        let _ = crate::state::take_pane_hint(&state_dir, id);
+        PidfileGuard(path)
+    });
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
@@ -1507,6 +1532,8 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
+    // someone left a notice for this pane and wants it seen now
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
@@ -1577,6 +1604,13 @@ pub async fn run(args: Args) -> Result<()> {
                     app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
                 }
                 app.paint();
+            }
+            _ = sigusr1.recv() => {
+                if let Some(id) = local_pane_id.as_deref() {
+                    if let Some(msg) = crate::state::take_pane_hint(&state_dir, id) {
+                        app.hint_for(&msg, Duration::from_secs(4));
+                    }
+                }
             }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,

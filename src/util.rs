@@ -226,13 +226,24 @@ pub fn pid_alive(pid: i32) -> bool {
 /// and re-prompts in every new shell until answered, so it fails every spawn,
 /// not one in a fortnight). The pidfile is how the daemon can tell the exec
 /// took, and retype it when it didn't.
+/// Squash anything that isn't `[A-Za-z0-9]` so an id can name a file.
+pub fn sane_component(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
 pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
-    let sane = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-    };
-    state_dir.join("streamer-pids").join(format!("{}--{}.pid", sane(ssh_target), sane(pane_target)))
+    state_dir
+        .join("streamer-pids")
+        .join(format!("{}--{}.pid", sane_component(ssh_target), sane_component(pane_target)))
+}
+
+/// Where the streamer of a given LOCAL herdr pane announces its pid.
+///
+/// `streamer_pid_path` addresses a streamer by what it is showing (host + remote
+/// pane). This addresses one by where it is showing it, which is the only handle
+/// a herdr event hook has: the hook is told a local pane id and nothing else.
+pub fn pane_pid_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir.join("pane-pids").join(format!("{}.pid", sane_component(local_pane_id)))
 }
 
 pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> bool {
@@ -240,6 +251,30 @@ pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> 
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
         .is_some_and(pid_alive)
+}
+
+/// Poke the streamer drawing a given local pane, so it picks up a notice left
+/// for it instead of waiting for its next deadline.
+///
+/// Checks the pid really is one of ours before signalling. A pid file outlives a
+/// streamer that was SIGKILLed, pids get reused, and SIGUSR1's default
+/// disposition is *terminate* — so acting on a stale file could kill a stranger.
+pub fn poke_pane_streamer(state_dir: &Path, local_pane_id: &str) -> bool {
+    let Some(pid) = fs::read_to_string(pane_pid_path(state_dir, local_pane_id))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1 && pid_alive(*p))
+    else {
+        return false;
+    };
+    let ours = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("herdr-mirror"));
+    if !ours {
+        return false;
+    }
+    unsafe { libc::kill(pid, libc::SIGUSR1) == 0 }
 }
 
 /// Sleep until the earliest deadline; pend forever when none.

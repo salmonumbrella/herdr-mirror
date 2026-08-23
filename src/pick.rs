@@ -259,6 +259,28 @@ fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
 /// The tab and split arms share their discovery: the focused workspace must
 /// be a live mirror, and the junk object is whatever holds a bare placeholder
 /// pane that the id map does not know.
+/// Tell the user why their tab just vanished.
+///
+/// Goes to the mirror panes, not the pane being closed: that one is a plain
+/// local shell with nothing of ours in it, while a mirror has a streamer that
+/// can paint its own status row (the one that says "reconnecting in 10s").
+///
+/// Every mirror pane in the workspace, not just the anchor, because which one
+/// the user is looking at during the gap is not knowable here. Closing the tab
+/// hands focus back to whichever tab herdr chooses, and the remote round trip
+/// takes a second or two before the replacement shows up. Panes in background
+/// tabs paint a status row nobody sees, which costs nothing.
+fn notice(env: &Env, targets: &[String], what: &str, host: &str) {
+    let msg = format!("intercepted: closing the local {what}, creating it on {host}");
+    for pane in targets {
+        crate::state::set_pane_hint(&env.state_dir, pane, &msg);
+        // Nudge it awake. A streamer's event loop sleeps until its next
+        // deadline, and with nothing pending that is never — the notice would
+        // sit unread until the remote happened to send a frame.
+        crate::util::poke_pane_streamer(&env.state_dir, pane);
+    }
+}
+
 async fn intercept_in_mirror(
     env: &Env,
     api: &ApiClient,
@@ -309,9 +331,7 @@ async fn intercept_in_mirror(
             break;
         }
     }
-    if host.is_none() {
-        return Ok(());
-    }
+    let Some(host) = host else { return Ok(()) };
 
     let panes: Value = api.request("pane.list", json!({})).await?;
     let all: Vec<&Value> = panes
@@ -343,6 +363,14 @@ async fn intercept_in_mirror(
     if settles_as_ours(env, api, config, &junk_id).await {
         return Ok(());
     }
+
+    // every mirror pane in this workspace, for the notice
+    let mirrors: Vec<String> = all
+        .iter()
+        .filter_map(|p| p.get("pane_id").and_then(Value::as_str))
+        .filter(|pid| mapped_panes.contains(*pid))
+        .map(str::to_string)
+        .collect();
 
     // a mirrored sibling to anchor the remote action's context on
     let sibling_in = |tab_only: bool| {
@@ -379,6 +407,7 @@ async fn intercept_in_mirror(
             let Some(anchor) = sibling_in(false) else { return Ok(()) };
             let before = tab_ids_in(api, ws_id).await;
             mark();
+            notice(env, &mirrors, "tab", &host.name);
             api.request("tab.close", json!({ "tab_id": junk_tab })).await?;
             run_remote(env, ws_id, &anchor, "tab", None).await?;
             focus_new_tab(api, ws_id, &before).await;
@@ -403,6 +432,7 @@ async fn intercept_in_mirror(
                 },
             };
             mark();
+            notice(env, &mirrors, "split", &host.name);
             api.request("pane.close", json!({ "pane_id": junk_id })).await?;
             run_remote(env, ws_id, &anchor, "split", Some(dir.as_str())).await
         }

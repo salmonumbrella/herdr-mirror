@@ -120,6 +120,44 @@ pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result
     }
 }
 
+/// A one-line notice for one specific mirror pane to show.
+///
+/// The interception runs in its own short-lived process and closes a plain
+/// local shell — nothing of ours is in that pane to draw with, and herdr has no
+/// API to write into someone else's pane. But the pane the user was *looking
+/// at* when they pressed the key is a live mirror with a streamer in it, and a
+/// streamer can paint its own status row. So the notice is addressed to that
+/// pane by its local id, and it lands in the same row as "reconnecting in 10s".
+///
+/// Keyed by pane id on purpose: an earlier version left the note unaddressed
+/// and the next streamer to start collected it, which was the replacement pane,
+/// reporting a move that had already finished.
+fn pane_hint_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir.join(format!(".hint-{}", crate::util::sane_component(local_pane_id)))
+}
+
+pub fn set_pane_hint(state_dir: &Path, local_pane_id: &str, msg: &str) {
+    let _ = std::fs::create_dir_all(state_dir);
+    let _ = std::fs::write(pane_hint_path(state_dir, local_pane_id), msg);
+}
+
+/// Read and consume this pane's notice, if any.
+pub fn take_pane_hint(state_dir: &Path, local_pane_id: &str) -> Option<String> {
+    let path = pane_hint_path(state_dir, local_pane_id);
+    let msg = std::fs::read_to_string(&path).ok()?;
+    // A notice is about something that just happened. One left behind by a
+    // streamer that died before collecting it is stale, and showing it later
+    // would report a close the user has long since forgotten. Stat before the
+    // unlink: afterwards there is nothing left to ask.
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|e| e < std::time::Duration::from_secs(30));
+    let _ = std::fs::remove_file(&path);
+    let msg = msg.trim().to_string();
+    (fresh && !msg.is_empty()).then_some(msg)
+}
+
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
@@ -188,6 +226,40 @@ mod tests {
         assert!(is_hidden(&dir, "h"));
         set_hidden(&dir, "h", false).unwrap();
         assert!(!is_hidden(&dir, "h"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pane_hint_goes_to_one_pane_and_only_once() {
+        let dir = std::env::temp_dir().join(format!("hm-hint-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        set_pane_hint(&dir, "wBT:p2", "closing the local tab");
+        // not the neighbour's: an unaddressed notice is what let the
+        // REPLACEMENT pane announce a move that had already finished
+        assert_eq!(take_pane_hint(&dir, "wBT:p3"), None);
+        assert_eq!(take_pane_hint(&dir, "wBT:p2").as_deref(), Some("closing the local tab"));
+        // consumed, so a repaint doesn't resurrect it
+        assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_pane_hint_is_dropped_not_shown() {
+        let dir = std::env::temp_dir().join(format!("hm-hint-old-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        set_pane_hint(&dir, "wBT:p2", "closing the local tab");
+        let path = pane_hint_path(&dir, "wBT:p2");
+        // backdate it: only the mtime distinguishes a notice from a leftover
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 120;
+        let t = libc::timeval { tv_sec: secs, tv_usec: 0 };
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), [t, t].as_ptr()) }, 0);
+        assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);
+        assert!(!path.exists(), "stale or not, it is consumed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
