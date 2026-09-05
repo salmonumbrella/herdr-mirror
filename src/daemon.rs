@@ -82,6 +82,7 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    "pane.agent_detected",
     // a bare remote resize (no pane created/closed) has no other event to
     // hang a converge off of; falls into the generic converge_at branch below
     // like any subscription this daemon doesn't special-case.
@@ -94,7 +95,7 @@ fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     subs
 }
 
-/// Broadcast structure events + per-pane agent-status subscriptions
+/// Broadcast structure/lifecycle events + per-pane agent-status subscriptions
 /// (pane.agent_status_changed requires a pane_id). A rejected pane
 /// subscription degrades to broadcast-only instead of killing the connection.
 async fn resubscribe(
@@ -911,6 +912,20 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Detection is a separate lifecycle event from later status changes. If
+    /// this broadcast subscription disappears, a newly detected agent can sit
+    /// stale until the periodic poll even though its pane is already mirrored.
+    #[test]
+    fn subscriptions_include_explicit_agent_detection() {
+        let subs = sub_list(&["w1:p1".to_string()]);
+
+        assert!(subs.contains(&json!({ "type": "pane.agent_detected" })));
+        assert!(subs.contains(&json!({
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+        })));
+    }
 
     /// One fallback is not evidence: the probe also fails when the remote herdr
     /// is restarting or the mux hiccups, and pinning a healthy host to the
