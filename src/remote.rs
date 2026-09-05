@@ -9,6 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -48,20 +49,64 @@ struct SshOutput {
 }
 
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
-    let fut = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    match timeout(Duration::from_millis(timeout_ms), fut).await {
-        Ok(Ok(o)) => SshOutput {
-            code: o.status.code().unwrap_or(1),
-            out: String::from_utf8_lossy(&o.stdout).into_owned(),
-            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+        .process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return SshOutput {
+                code: 1,
+                out: String::new(),
+                err: e.to_string(),
+            }
+        }
+    };
+    let process_group = child.id().map(|id| id as i32);
+    let mut stdout = child.stdout.take().expect("piped ssh stdout");
+    let mut stderr = child.stderr.take().expect("piped ssh stderr");
+    let mut out = Vec::new();
+    let mut err_output = Vec::new();
+    let collect = async {
+        let (status, stdout_result, stderr_result) = tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err_output)
+        );
+        stdout_result?;
+        stderr_result?;
+        status
+    };
+
+    match timeout(Duration::from_millis(timeout_ms), collect).await {
+        Ok(Ok(status)) => SshOutput {
+            code: status.code().unwrap_or(1),
+            out: String::from_utf8_lossy(&out).into_owned(),
+            err: String::from_utf8_lossy(&err_output).into_owned(),
         },
-        Ok(Err(e)) => SshOutput { code: 1, out: String::new(), err: e.to_string() },
-        Err(_) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
+        Ok(Err(e)) => SshOutput {
+            code: 1,
+            out: String::new(),
+            err: e.to_string(),
+        },
+        Err(_) => {
+            if let Some(process_group) = process_group {
+                // ProxyCommand and any other ssh descendants share this group.
+                // Killing only the direct child leaves those descendants behind.
+                unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            }
+            // Reap the direct child before a reconnect starts another ssh tree.
+            let _ = child.wait().await;
+            SshOutput {
+                code: 1,
+                out: String::new(),
+                err: "ssh timeout".into(),
+            }
+        }
     }
 }
 
@@ -697,6 +742,38 @@ mod tests {
         let deep = PathBuf::from("/Users/example/".to_string() + &"d".repeat(80));
         assert_ne!(socket_stem(&deep, "alpha-host-name"), socket_stem(&deep, "beta-host-name"));
         assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_proxy_command() {
+        let pid_path = test_path("timed-out-proxy-pid");
+        let proxy = format!(
+            "ProxyCommand=sh -c 'echo $$ > {}; exec sleep 30'",
+            pid_path.display()
+        );
+        let args = vec!["-o".into(), proxy, "timeout-test.invalid".into()];
+
+        let output = ssh(&args, 250).await;
+        let proxy_pid: i32 = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut proxy_survived = false;
+        for _ in 0..20 {
+            proxy_survived = unsafe { libc::kill(proxy_pid, 0) } == 0;
+            if !proxy_survived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        if proxy_survived {
+            unsafe { libc::kill(proxy_pid, libc::SIGKILL) };
+        }
+        let _ = fs::remove_file(pid_path);
+        assert_eq!(output.err, "ssh timeout");
+        assert!(!proxy_survived, "ProxyCommand survived the ssh timeout");
     }
 
     #[test]
