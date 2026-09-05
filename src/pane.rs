@@ -458,6 +458,60 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
     None
 }
 
+const MOUSE_INPUT_TIMEOUT: Duration = Duration::from_millis(150);
+const MAX_INCOMPLETE_MOUSE_BYTES: usize = 32;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum MouseSplit {
+    Pending,
+    Passthrough(Vec<u8>),
+}
+
+/// Find a possible SGR mouse sequence that ends at the current read boundary.
+/// Only a short, syntactically valid prefix is held; ordinary input keeps
+/// flowing to the existing routing code.
+fn trailing_incomplete_mouse(bytes: &[u8]) -> Option<usize> {
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != 0x1b {
+            continue;
+        }
+        let rest = &bytes[at..];
+        if rest == b"\x1b" || rest == b"\x1b[" {
+            return Some(at);
+        }
+        if rest.starts_with(b"\x1b[<")
+            && rest.len() <= MAX_INCOMPLETE_MOUSE_BYTES
+            && rest[3..].iter().all(|b| b.is_ascii_digit() || *b == b';')
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Hold only a trailing incomplete mouse sequence across stdin reads.
+pub(crate) fn split_mouse(buf: &mut Vec<u8>, chunk: Vec<u8>) -> MouseSplit {
+    let mut all = std::mem::take(buf);
+    all.extend_from_slice(&chunk);
+    let Some(at) = trailing_incomplete_mouse(&all) else {
+        return MouseSplit::Passthrough(all);
+    };
+    let tail = all.split_off(at);
+    *buf = tail;
+    if all.is_empty() {
+        MouseSplit::Pending
+    } else {
+        MouseSplit::Passthrough(all)
+    }
+}
+
+/// A timed-out lone ESC is still a key; an incomplete mouse prefix is dropped
+/// so it cannot leak as literal input into a remote shell.
+fn flush_mouse(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let pending = std::mem::take(buf);
+    (pending == b"\x1b").then_some(pending)
+}
+
 /// How a parsed mouse event should be routed while in control mode.
 #[derive(Debug, PartialEq, Eq)]
 enum MouseAction {
@@ -725,6 +779,9 @@ struct App {
     paste_inflight: bool,
     /// partially-received bracketed paste (see `intercept_paste`)
     paste_buf: Vec<u8>,
+    /// partially-received SGR mouse sequence
+    mouse_buf: Vec<u8>,
+    mouse_flush_at: Option<Instant>,
     /// input held back while an upload is in flight, flushed in order after
     paste_queue: Vec<Queued>,
     /// the payload that started the in-flight upload, so it can be forwarded
@@ -1082,6 +1139,24 @@ impl App {
         }
     }
 
+    /// Route ordinary input after preserving a partial SGR mouse sequence.
+    async fn route_mouse_input(&mut self, bytes: Vec<u8>) {
+        match split_mouse(&mut self.mouse_buf, bytes) {
+            MouseSplit::Pending => {}
+            MouseSplit::Passthrough(bytes) => self.route_input(bytes).await,
+        }
+        self.mouse_flush_at = (!self.mouse_buf.is_empty())
+            .then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
+    }
+
+    /// Flush an unfinished mouse prefix after its short completion window.
+    async fn flush_mouse_input(&mut self) {
+        self.mouse_flush_at = None;
+        if let Some(bytes) = flush_mouse(&mut self.mouse_buf) {
+            self.route_input(bytes).await;
+        }
+    }
+
     /// Drain every complete paste in this chunk, in order.
     ///
     /// Deliberately a loop, not a one-shot: two drops land in a single read
@@ -1094,9 +1169,15 @@ impl App {
         loop {
             match split_paste(&mut self.paste_buf, chunk) {
                 PasteSplit::Pending => return,
-                PasteSplit::Passthrough(bytes) => return self.route_input(bytes).await,
+                PasteSplit::Passthrough(bytes) => return self.route_mouse_input(bytes).await,
                 PasteSplit::Complete { before, body, after } => {
-                    self.route_input(before).await;
+                    self.route_mouse_input(before).await;
+                    // A partial mouse sequence cannot continue into a paste;
+                    // discard it before delivering the paste body directly.
+                    if !self.mouse_buf.is_empty() {
+                        self.mouse_buf.clear();
+                        self.mouse_flush_at = None;
+                    }
                     self.route_paste_body(body).await;
                     if after.is_empty() {
                         return;
@@ -1289,7 +1370,12 @@ impl App {
                             (false, _) => match self.select.release(at, raw) {
                                 // the clipboard holds one thing, so a second
                                 // gesture in the same read legitimately wins
-                                Released::Selection(span) => copy_span = Some(span),
+                                Released::Selection(span) => {
+                                    copy_span = Some(span);
+                                    // Finish this gesture before a later press in
+                                    // the same read starts the next selection.
+                                    sel_changed |= self.select.clear();
+                                },
                                 // It was a click, not a drag. TUI/agent get it
                                 // (claude and codex discard the bytes cleanly).
                                 // A shell does not: the prompt never enabled
@@ -1523,6 +1609,8 @@ pub async fn run(args: Args) -> Result<()> {
         app_cursor_keys: false,
         paste_inflight: false,
         paste_buf: Vec::new(),
+        mouse_buf: Vec::new(),
+        mouse_flush_at: None,
         paste_queue: Vec::new(),
         paste_original: None,
     };
@@ -1570,6 +1658,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.mouse_flush_at,
         ]);
 
         tokio::select! {
@@ -1650,6 +1739,9 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.settle_at.is_some_and(|t| t <= now) {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
+                }
+                if app.mouse_flush_at.is_some_and(|t| t <= now) {
+                    app.flush_mouse_input().await;
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
@@ -1797,6 +1889,44 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    #[test]
+    fn mouse_sequence_split_across_reads_is_reassembled() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split_mouse(&mut buf, b"pre\x1b[<0;3;2".to_vec()),
+            MouseSplit::Passthrough(b"pre".to_vec())
+        );
+        assert_eq!(buf, b"\x1b[<0;3;2");
+        assert_eq!(
+            split_mouse(&mut buf, b"Mpost".to_vec()),
+            MouseSplit::Passthrough(b"\x1b[<0;3;2Mpost".to_vec())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn mouse_prefix_can_split_at_escape_and_csi_introducer() {
+        let mut buf = Vec::new();
+        assert_eq!(split_mouse(&mut buf, b"\x1b".to_vec()), MouseSplit::Pending);
+        assert_eq!(split_mouse(&mut buf, b"[".to_vec()), MouseSplit::Pending);
+        assert_eq!(
+            split_mouse(&mut buf, b"<0;3;2M".to_vec()),
+            MouseSplit::Passthrough(b"\x1b[<0;3;2M".to_vec())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn timed_out_mouse_prefix_is_dropped_but_escape_survives() {
+        let mut mouse = b"\x1b[<0;3;2".to_vec();
+        assert_eq!(flush_mouse(&mut mouse), None);
+        assert!(mouse.is_empty());
+
+        let mut escape = b"\x1b".to_vec();
+        assert_eq!(flush_mouse(&mut escape), Some(b"\x1b".to_vec()));
+        assert!(escape.is_empty());
     }
 
 
@@ -2088,6 +2218,87 @@ mod tests {
         let (_, idx) = reconnect_delay(false, 0);
         let (_, idx) = reconnect_delay(true, idx);
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
+
+    // Exercise the real input routing: a release and the next press can share
+    // one stdin read. A local sink stands in for the session; no SSH is used.
+    async fn selection_followed_by_press(next_drag: bool) {
+        let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
+        let tty = true;
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            tx,
+            mode: Mode::Observe,
+            switching_to: None,
+            switch_at: None,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_failures: 0,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first classification
+            // moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
+            .spawn().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, pid: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Mouse);
+        // Keep foreground polling local to this fixture: suppress SSH probes.
+        app.fg_poll_at = Some(Instant::now());
+        // Blank cells exercise copy handling without writing to the clipboard.
+        app.grid.resize(80, 24);
+        app.handle_stdin(
+            b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m\x1b[<0;1;2M".to_vec(),
+        ).await;
+        let result = app.select.release(
+            if next_drag { (1, 3) } else { (1, 0) }, b"release",
+        );
+        drop(app);
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
+        if next_drag {
+            assert_eq!(result, Released::Selection(((1, 0), (1, 3))));
+        } else {
+            assert_eq!(result, Released::Click(b"\x1b[<0;1;2Mrelease".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_click_in_same_read() {
+        selection_followed_by_press(false).await;
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_drag_in_same_read() {
+        selection_followed_by_press(true).await;
     }
 
 }
