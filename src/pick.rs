@@ -230,6 +230,8 @@ async fn intercept_workspace(
     }) else {
         return Ok(());
     };
+    // A fixed directory does not identify the originating workspace. Keep
+    // native workspace interception restricted to our private placeholder.
     if w.get("label").and_then(Value::as_str) != Some(".mirror-pane")
         || w.get("pane_count").and_then(Value::as_u64) != Some(1)
     {
@@ -243,7 +245,7 @@ async fn intercept_workspace(
     }) else {
         return Ok(());
     };
-    if !is_bare_placeholder(p, placeholder) {
+    if !is_bare_placeholder(p, placeholder, None) {
         return Ok(());
     }
 
@@ -251,9 +253,12 @@ async fn intercept_workspace(
     open_popup(api, env).await
 }
 
-fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
+fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path, fixed_cwd: Option<&std::path::Path>) -> bool {
+    let Some(cwd) = pane.get("cwd").and_then(Value::as_str) else { return false };
+    let cwd = std::path::Path::new(cwd);
     pane.get("agent").is_none_or(Value::is_null)
-        && pane.get("cwd").and_then(Value::as_str) == placeholder.to_str()
+        && (crate::cwd_policy::same_path(cwd, placeholder)
+            || fixed_cwd.is_some_and(|fixed| crate::cwd_policy::same_path(cwd, fixed)))
 }
 
 /// The tab and split arms share their discovery: the focused workspace must
@@ -343,6 +348,7 @@ async fn intercept_in_mirror(
     // The junk is the object the event named, if it still qualifies — never
     // "the first unmapped placeholder we can find". Scanning is what let a
     // leftover pane become a target for an unrelated later event.
+    let fixed_cwd = crate::cwd_policy::local_fixed_path().await;
     let junk = all.iter().find(|p| {
         let pid = p.get("pane_id").and_then(Value::as_str).unwrap_or("");
         let named = if what == "tab" {
@@ -350,7 +356,7 @@ async fn intercept_in_mirror(
         } else {
             pid == target
         };
-        named && !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder)
+        named && !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder, fixed_cwd.as_deref())
     });
     let Some(junk) = junk else { return Ok(()) };
     let junk_id = junk.get("pane_id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -926,5 +932,52 @@ impl Drop for RawMode {
         }
         // cursor back on and mouse released even if finish() was never reached
         let _ = std::io::stdout().write_all(b"\x1b[?1000l\x1b[?25h");
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_path_requires_agentless_pane_and_explicit_opt_in() {
+        let placeholder = std::path::Path::new("/private/mirror-placeholder");
+        let fixed = std::path::Path::new("/projects");
+        let pane = json!({"cwd": "/projects", "agent": null});
+        assert!(is_bare_placeholder(&pane, placeholder, Some(fixed)));
+        assert!(!is_bare_placeholder(&pane, placeholder, None));
+        assert!(!is_bare_placeholder(&json!({"cwd": "/projects", "agent": "claude"}), placeholder, Some(fixed)));
+        assert!(!is_bare_placeholder(&json!({"agent": null}), placeholder, Some(fixed)));
+    }
+
+    #[test]
+    fn fixed_path_matches_a_symlink_alias() {
+        let root = std::env::temp_dir().join(format!("mirror-cwd-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let pane = json!({"cwd": root.join("real").canonicalize().unwrap(), "agent": null});
+        let matched = is_bare_placeholder(&pane, &root.join("placeholder"), Some(&root.join("alias")));
+        let different = is_bare_placeholder(&pane, &root.join("placeholder"), Some(&root.join("missing")));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(matched);
+        assert!(!different);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PR89_LOCAL_SOCKET pointing to an isolated test Herdr"]
+    async fn fixed_local_workspace_is_not_intercepted() {
+        let root = std::path::PathBuf::from(std::env::var("PR89_LIVE_ROOT").unwrap());
+        let env = Env {config_search: vec![], state_dir: root.clone(),
+            local_socket: std::env::var("PR89_LOCAL_SOCKET").unwrap().into()};
+        let api = ApiClient::connect(&env.local_socket).await.unwrap();
+        let ws = api.request("workspace.create", json!({"focus": false})).await.unwrap();
+        let id = ws["workspace"]["workspace_id"].as_str().unwrap();
+        let fixed = crate::cwd_policy::local_fixed_path().await.expect("fixed test policy");
+        assert!(is_bare_placeholder(&ws["root_pane"], &root.join(".mirror-pane"), Some(&fixed)));
+        intercept_workspace(&env, &api, &root.join(".mirror-pane"), id).await.unwrap();
+        let all = api.request("workspace.list", json!({})).await.unwrap();
+        assert!(all["workspaces"].as_array().unwrap().iter().any(|w| w["workspace_id"] == id));
+        api.request("workspace.close", json!({"workspace_id": id})).await.unwrap();
     }
 }
