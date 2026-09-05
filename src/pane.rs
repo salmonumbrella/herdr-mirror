@@ -221,6 +221,19 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
+    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    // A pane stream is long-lived and interactive. It must not inherit a
+    // ControlPath from ~/.ssh/config: a stale shared master can hang
+    // the stream before the remote command starts. `-S none` disables control
+    // socket use without changing the daemon's intentional multiplexing.
+    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
+    argv
+}
+
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
@@ -242,7 +255,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(cmd);
+            c.args(ssh_stream_args(&args.ssh_target, &cmd));
             c
         }
         Some(ct) => {
@@ -1776,6 +1789,21 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_ssh_stream_disables_configured_control_sockets() {
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+
+        assert_eq!(
+            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
+            [
+                "-S",
+                "none",
+                "work",
+                "exec herdr terminal session observe w5:pM",
+            ]
+        );
+    }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
     /// every existing headless-remote config silently changes behaviour.
